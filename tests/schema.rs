@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Schema tests (PRD R10, owned by T8): the real binary's `status --json`
 //! output is validated against the versioned `afanctl.status.v1` schema, and
 //! the plugin-facing `afanctl.cmd.v1` / `afanctl.state.v1` files are shape-

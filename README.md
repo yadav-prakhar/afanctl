@@ -69,7 +69,10 @@ Files installed:
 ## Command line
 
 `afanctl <verb> [options]`. Exit codes: **0** success, **1** runtime failure,
-**2** usage/CLI error (a bad flag never exits 0).
+**2** usage/CLI error (a bad flag never exits 0). The hidden `selftest-panic`
+probe additionally exits **101**: the deliberate panic *is* the probe, and
+101 is the deterministic Rust panic exit code (F6: probe vs. failure codes
+are documented apart on purpose).
 
 | Verb | Behavior |
 |---|---|
@@ -79,7 +82,7 @@ Files installed:
 | `once [--at-temp <C>] [--dry-run] [--json]` | exactly one control iteration, print the decision (scripts/CI) |
 | `observe` / `curve` | write the command file; the daemon applies it |
 | `hold <rpm>` | write a hold command; rejected below `fan1_min`, clamped to `fan1_max` |
-| `selftest-panic` | hidden: deliberate panic to prove L2 |
+| `selftest-panic` | hidden: deliberate panic to prove L2 (exits 101 by design) |
 
 Globals:
 
@@ -113,7 +116,8 @@ min_rpm = 1200        # clamped to >= fan1_min at load
 max_rpm = 6200        # clamped to <= fan1_max at load
 
 [poll]
-interval_s = 1        # >= 1
+interval_s = 1        # 1..=14; must stay below the unit's WatchdogSec=15
+                      # (one watchdog ping per poll — starving it crash-loops)
 ```
 
 Semantics:
@@ -122,8 +126,14 @@ Semantics:
 - A **present file** must contain all five keys. A missing key is **refused**
   (not defaulted) with the key name and the fix — a typo can never silently
   select a different curve. The daemon exits nonzero.
-- Validation rejects `high >= max`, `max > 95`, `min_rpm >= max_rpm`,
-  `interval_s < 1`, and non-integer values, naming the offending key.
+- Validation rejects `high`/`max` outside the 0..=95 °C band (a fan
+  controller's thresholds that can't reproduce a real temperature are a
+  config error), `high >= max`, `min_rpm >= max_rpm`, `interval_s < 1` or
+  `interval_s >= 15` (the poll cadence carries the watchdog pings; a poll
+  period at or above the unit's `WatchdogSec=15` crash-loops the daemon),
+  and non-integer values, naming the offending key and the fix. The
+  watchdog bound is the compiled-in constant `config::MAX_INTERVAL_S`
+  (= 15 s − 1 s margin), mirroring `packaging/afanctl.service`.
 - Safety tunables (verify tolerance, sensor-loss polls, overshoot polls, slew
   rate, write-fail fallback, retry count) are compiled-in constants, not config.
 
@@ -140,6 +150,13 @@ layout-change detection (the hwmon conversion in flight → "update the unit");
 and that the L2 death-path fd is armed. Each line is `PASS|FAIL|WARN — <check>
 — <detail>`; exit 1 if any check FAILs.
 
+**Root required (F11).** The write-mode checks (`fan1_manual` writable, L2 fd
+armed) open the manual file `O_WRONLY` and therefore require root. Run as
+non-root those checks **FAIL by design** and doctor exits 1 — an unwritable
+manual file leaves L2 unarmed, which is exactly a real problem, not a false
+alarm. Run the diagnostic pass under `sudo`/`pkexec` (the supervised gate
+does), or expect the FAIL lines plus exit 1 on an otherwise healthy machine.
+
 ### Interpreting `--compare <seconds>`
 
 `doctor --compare N` samples `t_eff` and the SMC's own rpm for `N` seconds in
@@ -155,6 +172,11 @@ The command file `/run/afanctl/cmd.json` (`schema: afanctl.cmd.v1`) is the
 plugin-facing control channel; `status --json` is its render feed. The daemon
 re-reads `cmd.json` every poll, validates it, and applies it through the same
 write-verify path (an unknown mode or out-of-range rpm is logged and ignored).
+A **freshness gate** applies: a re-issued command whose bytes are byte-identical
+to the last *applied* one is ignored (deliberate — freshness beats re-asserting
+the same write). To re-arm after monitor-only degradation, re-write the command
+with a changed payload or restart the daemon (F10; the behavior itself is
+deliberate and lock-tested, this note documents it).
 
 | Preset | Command |
 |---|---|
@@ -185,6 +207,18 @@ Integration tests spawn the real binary against a **tempdir copy** of
 at a tempdir; the repo fixture is never mutated. The `hw` feature is the only
 path that may touch real `/sys`, and only with `AFANCTL_HWTEST=1` **and**
 applesmc present — i.e. the supervised hardware gate.
+
+## Complexity
+
+The shipped product is ~3.5k non-test LOC against R11's ~1.4k aspiration
+(F13-doc). The delta is mandated surface, not creep: a `MockSmc` with the full
+fault-injection face the PRD's defect-class map demands (drift, write-not-
+taking, sensor outliers, mode flips), a `doctor` with per-check FAIL/WARN
+semantics plus the `--compare` divergence report, and every error carrying
+key + reason + fix as R6 requires. Each file's overage is ledgered in
+QUESTIONS.md/DEVIATIONS.md with its driver named. Slimming passes are deferred
+to after the supervised hardware gate; none is appropriate while the gate
+defects (T9 F1–F13) are still landing.
 
 ## License
 

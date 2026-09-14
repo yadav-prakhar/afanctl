@@ -639,6 +639,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
+
     use super::*;
     use crate::policy::MilliC;
     use crate::smc::{MockSmc, SensorReading};

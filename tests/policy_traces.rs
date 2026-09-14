@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Policy trace tests (PRD R10, owned by T2): the seven trace families from
 //! the mbpfan debate, written as data tables — input readings → expected
 //! decision sequences. Config below: high=66, max=86, low=63, rpm 1200..6200

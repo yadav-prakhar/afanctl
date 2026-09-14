@@ -179,3 +179,53 @@ DESIGN gains a doc note: selftest-panic arms L2 against the --sysfs-root backend
   AUTO on exit") could not be executed here: README is Ticket B's file and
   this ticket's RULES forbid touching it. Flagged for the orchestrator /
   Ticket B (one-line table edit: `once` row → "restores AUTO on exit").
+---
+
+## T9F-B — defect tickets F3/F4/F5/F6/F10/F11/F13-doc (branch `t9fix-b`, 2026-09-14)
+
+### N-T9F-B-1 (note): F4 enforces §8 lints via package `[lints]`; cli.rs/doctor.rs/tests/* blame deferred to Ticket A
+
+- **Old:** the §8 clippy gate (`unwrap_used`/`expect_used`/`panic`) was declared
+  but enforced nowhere (T9-F4).
+- **New:** the three lints live at `warn` in `Cargo.toml [lints.clippy]`
+  (edition-2021 package lints), so every `-D warnings` gate enforces them
+  end-to-end; `check.sh` gains the explicit expanded gate 2b. Scoped
+  `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` were
+  added ONLY inside `#[cfg(test)] mod tests` in B-owned files (config.rs,
+  policy.rs, safety.rs, notify.rs, smc.rs, supervisor.rs). `main.rs` needed
+  none (no hits — it runs the wiring, no unwraps); safety.rs' pre-existing
+  file-level `#![allow(clippy::panic)]` for the sanctioned `arm_test_panic`
+  is unchanged. `[lints] rust` left intentionally empty (the §8 bans are
+  clippy tool lints).
+- **Why:** per the card's RESOLUTION the lints cannot be "allow" globally, and
+  the branch must keep the gates green without touching Ticket A's files.
+- **Consequence (TODO for Ticket A):** until A lands its per-file attrs,
+  expanded-clippy errors are confined to `src/cli.rs`, `src/doctor.rs`
+  (A's files, test blocks) and the test targets `tests/integration.rs` (A's)
+  plus `tests/schema.rs` / `tests/policy_traces.rs` (outside both cards — B
+  may not touch `tests/` per the task card; recommend A or the planner add
+  the same one-line attrs there). check.sh gate 2b encodes exactly this
+  blame rule and fails on any error naming any other file.
+- **Affected tasks:** T9F-A (attrs in its own files; recommended stretch:
+  tests/*.rs attrs).
+
+### N-T9F-B-2 (note): F5 layer 2 hardened all four constant-multiply sites, not the two cited
+
+The ticket/review cites policy.rs:195 and :204; the identical
+threshold-×1000 pattern also exists at :207 and :210 (`max_c`, `high_c`).
+All four are converted to `saturating_mul` (plus `saturating_sub` for
+`max − 1` in `overshoot_check`); leaving two same-class sites raw would be an
+incomplete fix of the same defect. Saturation degrades toward cooling: an
+absurdly low threshold lands in the max zone → the fan goes to max. No
+public signature changed; `Config`/`ResolvedConfig` shapes untouched — F5's
+band validation reuses `ConfigError::Invalid { key, reason, fix }` as the
+card mandates.
+
+### N-T9F-B-3 (note): config.rs growth on top of a ledgered overage
+
+F3 (watchdog-coupling constants + rejection) and F5 (0..=95 °C band for
+high and max) add ~45 lines incl. their mandated tests to `src/config.rs`,
+already flagged over the §7 budget (N-T1-1). Same defect-fix scope as the
+card; nothing trimmed, no public item added beyond the two constants the
+card itself mandates (`WATCHDOG_UNIT_SEC`, `MAX_INTERVAL_S`). Reported, not
+absorbed silently (§8).

@@ -55,6 +55,8 @@ fn send(msg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
+
     use super::*;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
