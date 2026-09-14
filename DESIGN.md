@@ -146,7 +146,9 @@ pub fn install_death_path(panic_fd: i32);
 pub fn arm_test_panic() -> !;
 
 // ---- doctor.rs (diagnostics; read-only unless --roundtrip)
-pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32;
+//   Takes the CLI globals' root+config path explicitly — R5 globals are global
+//   redirects; T9-F2: doctor silently ignoring them is a defect.
+pub fn run(sysfs_root: &std::path::Path, config_path: Option<&std::path::Path>, roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32;
 //   json=true renders Appendix C output as JSON (same fields; R5 verb table).
 
 // ---- notify.rs (hand-rolled; no systemd crate)
