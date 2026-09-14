@@ -15,7 +15,7 @@
 //! refuses to write unless the L2 fd is armed (root + writable `fan1_manual`).
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -41,6 +41,11 @@ const FALLBACK_BINARY: &str = "/usr/bin/afanctl";
 const STALE_UNKNOWN: &str = "cannot determine daemon start time or binary mtime (fix: check `systemctl show afanctl.service --property=MainPID,ExecMainStartTimestamp`)";
 /// JSON schema id for `doctor --json` (Appendix C "reuses the same fields").
 const SCHEMA: &str = "afanctl.doctor.v1";
+/// Runtime dir for `state.json` (R7). `cli.rs`'s resolver is private, so
+/// doctor mirrors its two constants (RULING F25 allows the in-module copy).
+const DEFAULT_RUNTIME_DIR: &str = "/run/afanctl";
+/// Env override for the runtime dir, mirroring `cli.rs`.
+const RUNTIME_DIR_ENV: &str = "AFANCTL_RUNTIME_DIR";
 
 /// Checklist status (Appendix C). Only `Fail` drives the exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -127,6 +132,115 @@ struct CompareReport {
     verdict: String,
 }
 
+/// Resolve the daemon's runtime dir the way `status` does (R7): env override,
+/// else `/run/afanctl`.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os(RUNTIME_DIR_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_RUNTIME_DIR))
+}
+
+/// Daemon-mode check (RULING F25, PRD §9.3g): read the daemon's published
+/// runtime state (R7, same file `status` reads) and surface a held or degraded
+/// daemon as WARN. Never FAIL — a user-driven hold or a degraded latch is a
+/// diagnostic, and R5/Appendix C reserve the exit code for FAIL.
+fn daemon_mode_check(runtime_dir: &Path) -> Check {
+    let state = std::fs::read_to_string(runtime_dir.join("state.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    classify_daemon_mode(state.as_ref())
+}
+
+/// Pure daemon-mode classifier (unit-tested without `/run` or hardware).
+fn classify_daemon_mode(state: Option<&serde_json::Value>) -> Check {
+    let name = "daemon mode";
+    let Some(state) = state else {
+        return Check::pass(name, "no running daemon (observe is the default)");
+    };
+    let mode = state.get("mode").and_then(serde_json::Value::as_str);
+    let flag = |key: &str| {
+        state
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let mut flags: Vec<String> = Vec::new();
+    if flag("monitor_only") {
+        flags.push("monitor_only=true".to_string());
+    }
+    if flag("auto_restore_pending") {
+        flags.push("auto_restore_pending=true".to_string());
+    }
+    if !flags.is_empty() {
+        // INVARIANT: the degraded latch outranks `mode` in the message — the
+        // truth is "requested X, writing nothing" (RULING F25).
+        return Check::warn(
+            name,
+            format!(
+                "{} (requested {}, writing nothing){}",
+                flags.join(", "),
+                mode.unwrap_or("unknown"),
+                newest_error(state)
+            ),
+        );
+    }
+    match mode {
+        Some("hold") => Check::warn(
+            name,
+            format!(
+                "hold active ({} rpm, manual=true) — overshoot guard still applies; release with `afanctl observe`",
+                held_rpm(state)
+            ),
+        ),
+        Some("curve") => Check::pass(name, "mode: curve (daemon is driving the fan)"),
+        Some("observe") => Check::pass(name, "mode: observe (firmware owns the fan)"),
+        other => Check::warn(
+            name,
+            format!(
+                "unknown mode {} in state.json (fix: the daemon writes observe/curve/hold)",
+                other.map_or("(missing)".to_string(), |m| format!("{m:?}"))
+            ),
+        ),
+    }
+}
+
+/// Held rpm for the hold WARN: `target_rpm`, falling back to
+/// `last_written_rpm` (Appendix B), else a marker.
+fn held_rpm(state: &serde_json::Value) -> String {
+    state
+        .get("target_rpm")
+        .or_else(|| state.get("last_written_rpm"))
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "unknown".to_string(), |rpm| rpm.to_string())
+}
+
+/// `; newest error: <ts> <msg>` from `recent_errors`' last entry (empty when
+/// the ring is absent or empty).
+fn newest_error(state: &serde_json::Value) -> String {
+    let Some(err) = state
+        .get("recent_errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| errors.last())
+    else {
+        return String::new();
+    };
+    let ts = err
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let msg = err
+        .get("msg")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let joined = format!("{ts} {msg}");
+    let joined = joined.trim();
+    if joined.is_empty() {
+        String::new()
+    } else {
+        format!("; newest error: {joined}")
+    }
+}
+
 /// Run the doctor suite (Appendix A, amended by ruling D-T9-F2): the CLI
 /// globals are explicit parameters — `sysfs_root` redirects all sysfs access
 /// (R5), `config_path = None` falls back to the module-default config path
@@ -139,7 +253,14 @@ pub fn run(
     json: bool,
 ) -> i32 {
     let config_path = config_path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG));
-    run_at(sysfs_root, config_path, roundtrip, compare_secs, json)
+    run_at(
+        sysfs_root,
+        config_path,
+        &runtime_dir(),
+        roundtrip,
+        compare_secs,
+        json,
+    )
 }
 
 /// Implementation seam: resolves `config_path` already, so unit tests can
@@ -148,11 +269,12 @@ pub fn run(
 fn run_at(
     root: &Path,
     config_path: &Path,
+    runtime_dir: &Path,
     roundtrip: bool,
     compare_secs: Option<u64>,
     json: bool,
 ) -> i32 {
-    let (mut report, mut smc) = diagnose(root, config_path);
+    let (mut report, mut smc) = diagnose(root, config_path, runtime_dir);
 
     if roundtrip {
         let check = match smc.as_mut() {
@@ -196,7 +318,7 @@ fn run_at(
 
 /// Build the read-only checklist. Returns the backend too so `run_at` can run
 /// the opt-in write test / comparison without re-discovering hardware.
-fn diagnose(root: &Path, config_path: &Path) -> (Report, Option<SysfsSmc>) {
+fn diagnose(root: &Path, config_path: &Path, runtime_dir: &Path) -> (Report, Option<SysfsSmc>) {
     let mut checks = Vec::new();
     let opened = SysfsSmc::open(root);
     let smc = match opened {
@@ -233,6 +355,7 @@ fn diagnose(root: &Path, config_path: &Path) -> (Report, Option<SysfsSmc>) {
             ));
             checks.push(systemd_check());
             checks.push(stale_binary_check());
+            checks.push(daemon_mode_check(runtime_dir));
             checks.push(if backend.layout_changed() {
                 Check::warn(
                     "applesmc layout unchanged",
@@ -269,6 +392,7 @@ fn diagnose(root: &Path, config_path: &Path) -> (Report, Option<SysfsSmc>) {
             checks.push(config_check(config_path, None));
             checks.push(systemd_check());
             checks.push(stale_binary_check());
+            checks.push(daemon_mode_check(runtime_dir));
             checks.push(Check::warn(
                 "applesmc layout unchanged",
                 "unknown: discovery failed",
@@ -802,6 +926,10 @@ mod tests {
         Ok(())
     }
 
+    fn no_state_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/absent-runtime")
+    }
+
     fn check<'a>(report: &'a Report, name: &str) -> &'a Check {
         report
             .checks
@@ -821,7 +949,11 @@ mod tests {
     /// Healthy fixture: every check passes or warns; exit 0.
     #[test]
     fn healthy_fixture_exits_zero() {
-        let (report, smc) = diagnose(&fixture_root(), &fixture_root().join("absent.toml"));
+        let (report, smc) = diagnose(
+            &fixture_root(),
+            &fixture_root().join("absent.toml"),
+            &no_state_dir(),
+        );
         assert!(smc.is_some(), "canonical fixture must discover");
         assert!(
             !any_fail(&report),
@@ -846,6 +978,7 @@ mod tests {
             run_at(
                 &fixture_root(),
                 &fixture_root().join("absent.toml"),
+                &no_state_dir(),
                 false,
                 None,
                 false
@@ -858,7 +991,7 @@ mod tests {
     #[test]
     fn missing_coretemp_fails() {
         let root = fixture_root().join("no_coretemp");
-        let (report, smc) = diagnose(&root, &root.join("absent.toml"));
+        let (report, smc) = diagnose(&root, &root.join("absent.toml"), &no_state_dir());
         assert!(smc.is_none());
         assert!(any_fail(&report));
         assert_eq!(
@@ -866,7 +999,14 @@ mod tests {
             Status::Fail
         );
         assert_eq!(
-            run_at(&root, &root.join("absent.toml"), false, None, false),
+            run_at(
+                &root,
+                &root.join("absent.toml"),
+                &no_state_dir(),
+                false,
+                None,
+                false
+            ),
             1
         );
     }
@@ -875,14 +1015,21 @@ mod tests {
     #[test]
     fn missing_fan_fails() {
         let root = fixture_root().join("missing_fan");
-        let (report, _) = diagnose(&root, &root.join("absent.toml"));
+        let (report, _) = diagnose(&root, &root.join("absent.toml"), &no_state_dir());
         assert!(any_fail(&report));
         assert_eq!(
             check(&report, "fan files present & writable").status,
             Status::Fail
         );
         assert_eq!(
-            run_at(&root, &root.join("absent.toml"), false, None, false),
+            run_at(
+                &root,
+                &root.join("absent.toml"),
+                &no_state_dir(),
+                false,
+                None,
+                false
+            ),
             1
         );
     }
@@ -896,7 +1043,7 @@ mod tests {
         let manual = fixture.fan_path("fan1_manual");
         fs::remove_file(&manual).expect("remove file");
         fs::create_dir(&manual).expect("replace with dir");
-        let (report, smc) = diagnose(&fixture.root, &fixture.config_path());
+        let (report, smc) = diagnose(&fixture.root, &fixture.config_path(), &fixture.root);
         assert!(smc.is_some(), "discovery itself still succeeds");
         assert_eq!(
             check(&report, "fan files present & writable").status,
@@ -904,7 +1051,14 @@ mod tests {
         );
         assert_eq!(check(&report, "L2 fd armed").status, Status::Fail);
         assert_eq!(
-            run_at(&fixture.root, &fixture.config_path(), false, None, false),
+            run_at(
+                &fixture.root,
+                &fixture.config_path(),
+                &fixture.root,
+                false,
+                None,
+                false
+            ),
             1
         );
     }
@@ -919,7 +1073,7 @@ mod tests {
             "[thresholds]\nhigh = 90\nmax = 80\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = 1\n",
         )
         .expect("write bad config");
-        let (report, _) = diagnose(&fixture.root, &cfg);
+        let (report, _) = diagnose(&fixture.root, &cfg, &fixture.root);
         let c = check(&report, "config validation");
         assert_eq!(c.status, Status::Fail);
         assert!(
@@ -928,7 +1082,10 @@ mod tests {
             c.detail
         );
         assert!(c.detail.contains("fix:"), "detail names fix: {}", c.detail);
-        assert_eq!(run_at(&fixture.root, &cfg, false, None, false), 1);
+        assert_eq!(
+            run_at(&fixture.root, &cfg, &fixture.root, false, None, false),
+            1
+        );
     }
 
     /// A valid file with an unknown key is a WARN, not a FAIL (R6).
@@ -941,7 +1098,7 @@ mod tests {
             "[thresholds]\nhigh = 66\nmax = 86\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = 1\n[future]\nx = 1\n",
         )
         .expect("write config");
-        let (report, _) = diagnose(&fixture.root, &cfg);
+        let (report, _) = diagnose(&fixture.root, &cfg, &fixture.root);
         assert_eq!(check(&report, "config validation").status, Status::Warn);
         assert!(!any_fail(&report), "unknown keys must not fail the run");
     }
@@ -951,7 +1108,7 @@ mod tests {
     #[test]
     fn changed_layout_warns() {
         let root = fixture_root().join("layout_changed");
-        let (report, smc) = diagnose(&root, &root.join("absent.toml"));
+        let (report, smc) = diagnose(&root, &root.join("absent.toml"), &no_state_dir());
         assert!(smc.is_some());
         assert_eq!(
             check(&report, "applesmc layout unchanged").status,
@@ -959,7 +1116,14 @@ mod tests {
         );
         assert!(!any_fail(&report), "layout change must not fail the run");
         assert_eq!(
-            run_at(&root, &root.join("absent.toml"), false, None, false),
+            run_at(
+                &root,
+                &root.join("absent.toml"),
+                &no_state_dir(),
+                false,
+                None,
+                false
+            ),
             0
         );
     }
@@ -968,7 +1132,7 @@ mod tests {
     #[test]
     fn over_tjmax_sensor_fails() {
         let root = fixture_root().join("outlier_hi");
-        let (report, _) = diagnose(&root, &root.join("absent.toml"));
+        let (report, _) = diagnose(&root, &root.join("absent.toml"), &no_state_dir());
         // 125000 is outside the smc outlier window, so it reads as a failed
         // sensor, not a >100 °C value: the remaining valid sensors still pass.
         assert_eq!(
@@ -981,7 +1145,7 @@ mod tests {
     #[test]
     fn all_sensors_failed_is_fail() {
         let root = fixture_root().join("no_coretemp");
-        let (report, _) = diagnose(&root, &root.join("absent.toml"));
+        let (report, _) = diagnose(&root, &root.join("absent.toml"), &no_state_dir());
         assert_eq!(
             check(&report, "sensor plausibility vs Tjmax 100 C").status,
             Status::Fail
@@ -999,7 +1163,14 @@ mod tests {
             fs::read_to_string(&manual).expect("read manual"),
             fs::read_to_string(&output).expect("read output"),
         );
-        let _ = run_at(&fixture.root, &fixture.config_path(), false, None, true);
+        let _ = run_at(
+            &fixture.root,
+            &fixture.config_path(),
+            &fixture.root,
+            false,
+            None,
+            true,
+        );
         let after = (
             fs::read_to_string(&manual).expect("read manual"),
             fs::read_to_string(&output).expect("read output"),
@@ -1036,7 +1207,14 @@ mod tests {
     #[test]
     fn roundtrip_without_hardware_fails() {
         let root = fixture_root().join("no_coretemp");
-        let code = run_at(&root, &root.join("absent.toml"), true, None, true);
+        let code = run_at(
+            &root,
+            &root.join("absent.toml"),
+            &no_state_dir(),
+            true,
+            None,
+            true,
+        );
         assert_eq!(code, 1);
     }
 
@@ -1193,5 +1371,132 @@ mod tests {
         assert!(text.starts_with("PASS — a check — a detail\n"));
         assert!(text.contains("sample  t_eff(C)  smc_rpm  our_rpm  delta_rpm"));
         assert!(text.contains("verdict:"));
+    }
+
+    // --- RULING F25: `daemon mode` check (hold/degraded ⇒ WARN) ---
+
+    /// RULING F25 test 1: a state file in hold mode yields a WARN naming the
+    /// held rpm, and the WARN never changes doctor's exit code.
+    #[test]
+    fn hold_state_warns_naming_rpm_without_failing() {
+        let fixture = TempFixture::copy_of("");
+        fs::write(
+            fixture.root.join("state.json"),
+            r#"{"schema":"afanctl.state.v1","mode":"hold","target_rpm":3000,"monitor_only":false,"auto_restore_pending":false,"recent_errors":[]}"#,
+        )
+        .expect("seed state.json");
+        let (report, _) = diagnose(&fixture.root, &fixture.config_path(), &fixture.root);
+        let c = check(&report, "daemon mode");
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("3000"), "names held rpm: {}", c.detail);
+        assert!(c.detail.contains("manual=true"), "{}", c.detail);
+        assert!(c.detail.contains("afanctl observe"), "{}", c.detail);
+        assert!(!any_fail(&report), "a hold must not FAIL doctor");
+        assert_eq!(
+            run_at(
+                &fixture.root,
+                &fixture.config_path(),
+                &fixture.root,
+                false,
+                None,
+                false
+            ),
+            0,
+            "a WARN must leave the exit code alone"
+        );
+    }
+
+    /// RULING F25 test 2: observe and curve are PASS lines that name the mode.
+    #[test]
+    fn observe_and_curve_states_pass() {
+        let observe = classify_daemon_mode(Some(&serde_json::json!({"mode": "observe"})));
+        assert_eq!(observe.status, Status::Pass);
+        assert!(observe.detail.contains("observe"), "{}", observe.detail);
+        let curve = classify_daemon_mode(Some(&serde_json::json!({"mode": "curve"})));
+        assert_eq!(curve.status, Status::Pass);
+        assert!(curve.detail.contains("curve"), "{}", curve.detail);
+    }
+
+    /// RULING F25 test 3: the degraded latches escalate to WARN (never FAIL),
+    /// name their flag(s), and carry the newest recent error.
+    #[test]
+    fn degraded_latches_warn_with_flag_and_newest_error() {
+        let monitor = classify_daemon_mode(Some(&serde_json::json!({
+            "mode": "curve",
+            "monitor_only": true,
+            "recent_errors": [{"ts": "2026-09-14T15:02:11+05:30", "msg": "write verify failed"}],
+        })));
+        assert_eq!(monitor.status, Status::Warn);
+        assert!(
+            monitor.detail.contains("monitor_only=true"),
+            "{}",
+            monitor.detail
+        );
+        assert!(
+            monitor.detail.contains("requested curve, writing nothing"),
+            "{}",
+            monitor.detail
+        );
+        assert!(
+            monitor.detail.contains("write verify failed"),
+            "{}",
+            monitor.detail
+        );
+
+        let pending = classify_daemon_mode(Some(&serde_json::json!({
+            "mode": "observe",
+            "auto_restore_pending": true,
+        })));
+        assert_eq!(pending.status, Status::Warn);
+        assert!(
+            pending.detail.contains("auto_restore_pending=true"),
+            "{}",
+            pending.detail
+        );
+    }
+
+    /// RULING F25 test 4: no state file means no running daemon — PASS.
+    #[test]
+    fn no_state_file_passes() {
+        assert_eq!(classify_daemon_mode(None).status, Status::Pass);
+        assert!(classify_daemon_mode(None)
+            .detail
+            .contains("no running daemon"));
+        let fixture = TempFixture::copy_of("");
+        let (report, _) = diagnose(&fixture.root, &fixture.config_path(), &fixture.root);
+        assert_eq!(check(&report, "daemon mode").status, Status::Pass);
+    }
+
+    /// RULING F25: an unrecognised or absent `mode` is a WARN naming the raw
+    /// value — never a FAIL.
+    #[test]
+    fn unknown_mode_warns_naming_raw_value() {
+        let weird = classify_daemon_mode(Some(&serde_json::json!({"mode": "turbo"})));
+        assert_eq!(weird.status, Status::Warn);
+        assert!(weird.detail.contains("turbo"), "{}", weird.detail);
+        let missing =
+            classify_daemon_mode(Some(&serde_json::json!({"schema": "afanctl.state.v1"})));
+        assert_eq!(missing.status, Status::Warn);
+        assert!(missing.detail.contains("(missing)"), "{}", missing.detail);
+    }
+
+    /// RULING F25: `--json` reuses the human fields for the daemon-mode line.
+    #[test]
+    fn daemon_mode_json_carries_fields() {
+        let report = Report {
+            schema: SCHEMA,
+            checks: vec![classify_daemon_mode(Some(&serde_json::json!({
+                "mode": "hold",
+                "target_rpm": 4000
+            })))],
+            compare: None,
+        };
+        let json = serde_json::to_value(&report).expect("serialize");
+        assert_eq!(json["checks"][0]["name"], "daemon mode");
+        assert_eq!(json["checks"][0]["status"], "WARN");
+        assert!(json["checks"][0]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("4000"));
     }
 }
