@@ -72,3 +72,6 @@
 - Rulings: D1, D-T6-1, T3-N2, T1 Q-T1-1, T6 Q-T6-1, D-T6-1, D-T8-1, T9 F2-doctor-sig — all adjudicated & propagated.
 - LOC: product ~3.5k (over budget, stop-and-reported, weighed by T9 as quality risk; not a defect).
 - Remaining for user: §9.3 a-g checklist + makepkg -si (Appendix P5 in PLAN.md; ve PRD §9.3/9.4).
+- [FINAL GATE SWEEP] hold-integration test used interval_s=30 (pre-F3) → dead after F3 cap; retuned to 10 s
+  (still one long poll, now legal). ALL FOUR GATES GREEN on main at 8c6d2fd.
+- [STATUS] Build complete. §9.3/§9.4 supervised hardware gate handed to user (Appendix P5, PLAN.md).
