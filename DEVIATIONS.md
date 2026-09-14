@@ -145,3 +145,37 @@ documented; minimal scope (9-line arm + dispatch wiring). The verb exists precis
 prove L2; without arming the death path the §9.3c gate and R10 test are unsatisfiable.
 File-ownership breach acknowledged as justified (T6 owner inactive; safety-critical hole).
 DESIGN gains a doc note: selftest-panic arms L2 against the --sysfs-root backend.
+
+## FX-A — T9 fix ticket A (F1, F2, F7, F8, F9, F12)
+
+### D-T9-F7: `status` `uptime_s` renders pings × interval_s (approximation chosen)
+
+- **Choice:** the simpler no-signature-change option — `status --json`
+  computes `uptime_s = watchdog_pings × interval_s` (saturating multiply;
+  interval from the config as loaded). No field renamed, `state.json` schema
+  untouched.
+- **Approximation:** the daemon pings once per poll, so this approximates
+  wall-clock uptime; per-poll write/verify time is not counted.
+- **Open item:** the ticket asked for the approximation to be documented in an
+  Appendix B comment, but DESIGN.md is outside this ticket's file list — the
+  Appendix B comment needs adding by the DESIGN owner (flagged to the
+  orchestrator).
+
+### D-T9-F9: "/sys" + default-config-path duplication resolution
+
+- The duplicated `"/sys"` constant is gone: `doctor::run` now receives
+  `sysfs_root` explicitly (D-T9-F2), so only `cli.rs` holds
+  `DEFAULT_SYSFS_ROOT`.
+- The default config path (`/etc/afanctl/afanctl.toml`) remains a private
+  const in BOTH `cli.rs` (parse/usage default) and `doctor.rs`
+  (`config_path = None` fallback). `smc.rs` exports no consts and is T3's
+  read-only file; adding a new public item would require a DESIGN amendment,
+  so per the ticket the param-only shape was kept. Drift risk accepted and
+  noted here.
+
+### N-FX-A-1 (note, not a deviation): README `once` row update belongs to Ticket B
+
+- F1's doc half ("update the README once-row to state that `once` restores
+  AUTO on exit") could not be executed here: README is Ticket B's file and
+  this ticket's RULES forbid touching it. Flagged for the orchestrator /
+  Ticket B (one-line table edit: `once` row → "restores AUTO on exit").
