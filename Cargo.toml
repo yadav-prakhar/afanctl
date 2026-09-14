@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.98"
 description = "applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
-license = "MIT"
+license = "GPL-3.0-only"
 
 # DESIGN §8 (T9-F4): unwrap/expect/panic are denied by every `-D warnings`
 # gate (check.sh gates 2 and 2b). Scoped allowlists live ONLY inside

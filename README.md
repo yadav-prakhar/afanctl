@@ -284,4 +284,7 @@ carve up working, gate-tested code post-hoc.
 
 ## License
 
-MIT.
+GPL-3.0-only — see [`LICENSE`](LICENSE) (GNU General Public License v3.0).
+afanctl is free software: you may use, study, modify and redistribute it under
+the terms of that license; there is no warranty. Note the cargo/package
+metadata uses the SPDX form `GPL-3.0-only`.

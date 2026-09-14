@@ -8,8 +8,8 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
 arch=('x86_64')
-url="https://example.invalid/afanctl"
-license=('MIT')
+url="https://github.com/yadav-prakhar/afanctl"
+license=('GPL-3.0-only')
 depends=()
 makedepends=('rust')
 # pacman preserves user edits across upgrades (R6/H5).
