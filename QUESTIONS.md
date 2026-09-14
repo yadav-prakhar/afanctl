@@ -64,3 +64,35 @@ surface per DESIGN's "scriptable ... faults, drift, latency"), discovery
 walks (Q4/Q5-proof), K=3 write-verify on both writers, outlier window, and
 the card-required layout hook. Reporting rather than absorbing silently;
 Nothing was cut to fit, and no public item drifted to save lines.
+## T6 — cli + main (PHASE a)
+
+### Q-T6-1: runtime-dir override for `cmd.json` / `state.json`
+
+R8 pins `cmd.json`/`state.json` at `/run/afanctl/`, but R5 defines only
+`--config` and `--sysfs-root` as globals. Integration tests (T8) therefore have
+no sanctioned way to redirect the runtime dir off the real `/run` (root-owned,
+shared between tests). PHASE (a) reads `AFANCTL_RUNTIME_DIR` when set and
+defaults to `/run/afanctl`. Question: is this env seam blessed for T5/T8, or
+should a `--runtime-dir` global / explicit `RuntimePaths` injection be added?
+No behavior beyond the default was invented; flagging the seam.
+
+### Q-T6-2: deliberate PHASE-a deferrals
+
+- `once --at-temp <C>` (simulated sensor input) and `--dry-run` are parsed and
+  debug-logged but not yet applied — they need the real `StepReport` (PHASE b).
+- `hold <rpm>` writes the raw rpm to `cmd.json` without R5's "clamp to hw range
+  / reject below `fan1_min`" check, because the hardware min/max come from `smc`
+  (T3, still a stub). The daemon re-validates/clamps (R8), so no unsafe write
+  occurs; the CLI check lands in PHASE (b).
+- `status` output (human + `afanctl.status.v1`) is formatted in full but cannot
+  be verified against real data yet; PHASE (b) verifies the config + state file
+  + direct-sysfs merge (R7).
+
+### Q-T6-3: `cli.rs` LOC vs the §7 budget (~200)
+
+`src/cli.rs` is ~650 lines (`wc -l`, tests included) at PHASE (a) scope: the
+exact R5 parser + parser-table tests, all-verb dispatch, Appendix B/C
+formatting, and exit-code discipline. §7 budgets cli.rs at ~200 (±20% = 240).
+Flagged rather than silently absorbed (PLAN §2 rule). Options: (a) accept as
+PHASE-a scope and let PHASE (b) refactor to fit; (b) split Appendix B/C
+formatting into PHASE (b) or its own module. Awaiting the planner's ruling.

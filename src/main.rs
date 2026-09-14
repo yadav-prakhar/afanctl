@@ -1,16 +1,20 @@
-//! Wiring only: parse args, init `tracing`, dispatch to the verb handler, map
-//! errors to exit codes (0 success / 1 runtime failure / 2 usage).
+//! Wiring only: initialise logging, hand off to `cli::run`, and map its return
+//! to the process exit code (0 success / 1 runtime failure / 2 usage; R11).
 //!
-//! Invariants: no logic here beyond wiring; `unwrap`/`expect` permitted only
-//! in this file (§8); never touches sysfs paths itself (owned by `smc`).
+//! Invariants: no logic here beyond wiring (§8); `unwrap`/`expect` are
+//! permitted only in this file; this module never touches sysfs paths itself
+//! (`smc` owns all path strings).
 
 fn main() {
-    // Wiring only; real dispatch is owned by T6.
-    let code: i32 = stub_exit();
-    std::process::exit(code);
+    init_tracing();
+    std::process::exit(afanctl::cli::run());
 }
 
-/// Placeholder dispatcher until T6 lands the real one.
-fn stub_exit() -> i32 {
-    unimplemented!("owned by T6")
+/// Logging via `tracing` to stderr; journald captures it under systemd (R7).
+/// A missing global subscriber must never abort a run, so the result is ignored.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
