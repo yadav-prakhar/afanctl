@@ -77,7 +77,7 @@ are documented apart on purpose).
 | Verb | Behavior |
 |---|---|
 | `daemon [--mode observe\|curve]` | run the supervisor loop (systemd `Type=notify`; default `observe`) |
-| `status [--json]` | per-sensor temps, `t_eff`, mode, fan actual/target/min/max, manual?, config provenance, recent errors |
+| `status [--json]` | per-sensor temps, `t_eff`, mode (marked `(monitor-only)` when degraded), fan actual/target/min/max, manual?, config provenance, recent errors |
 | `doctor [--json] [--roundtrip] [--compare <s>]` | diagnostics; exit 1 if any check FAILs |
 | `once [--at-temp <C>] [--dry-run] [--json]` | exactly one control iteration, print the decision (scripts/CI) |
 | `observe` / `curve` | write the command file; the daemon applies it |
@@ -177,6 +177,16 @@ to the last *applied* one is ignored (deliberate — freshness beats re-assertin
 the same write). To re-arm after monitor-only degradation, re-write the command
 with a changed payload or restart the daemon (F10; the behavior itself is
 deliberate and lock-tested, this note documents it).
+
+`state.json` and `status --json`'s `daemon` object both carry a boolean
+`monitor_only` (additive fields; the `v1` schema ids are unchanged). It is the
+degraded latch: `true` means the daemon is **observing only** — no fan writes —
+after repeated verified-write failures, or a startup where AUTO could not be
+restored. The commanded `mode` is kept as-is, so `mode: "curve"` with
+`monitor_only: true` means "curve was requested, but nothing is being written",
+and `recent_errors` names the cause. Human `status` renders this as
+`mode: curve (monitor-only)`. A plugin must render the latch, not the mode
+alone.
 
 | Preset | Command |
 |---|---|

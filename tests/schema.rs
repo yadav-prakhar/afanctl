@@ -100,10 +100,20 @@ fn is_temp_or_null(v: &serde_json::Value) -> bool {
 fn assert_status_v1(v: &serde_json::Value) {
     assert_eq!(v["schema"], "afanctl.status.v1", "schema tag");
     let daemon = v["daemon"].as_object().expect("daemon object");
-    for key in ["running", "mode", "watchdog_armed", "uptime_s"] {
+    for key in [
+        "running",
+        "mode",
+        "monitor_only",
+        "watchdog_armed",
+        "uptime_s",
+    ] {
         assert!(daemon.contains_key(key), "daemon.{key} missing");
     }
     assert!(daemon["running"].is_boolean());
+    assert!(
+        daemon["monitor_only"].is_boolean(),
+        "F18 A1: additive latch flag"
+    );
     assert!(daemon["watchdog_armed"].is_boolean());
     assert!(daemon["uptime_s"].is_u64());
     assert!(daemon["mode"].is_string());
@@ -170,6 +180,7 @@ fn assert_state_v1(v: &serde_json::Value) {
         "last_written_rpm",
         "actual_rpm",
         "verified",
+        "monitor_only",
         "watchdog_pings",
         "recent_errors",
     ] {
@@ -179,6 +190,10 @@ fn assert_state_v1(v: &serde_json::Value) {
     assert!(v["mode"].is_string());
     assert!(is_temp_or_null(&v["t_eff_c"]));
     assert!(v["verified"].is_boolean());
+    assert!(
+        v["monitor_only"].is_boolean(),
+        "F18 A1: additive latch flag"
+    );
     assert!(v["watchdog_pings"].is_u64());
     assert!(v["recent_errors"].is_array());
 }
@@ -200,6 +215,10 @@ fn status_json_matches_afanctl_status_v1() {
     // Daemon down (fresh runtime dir): running=false, live sysfs still read.
     assert_eq!(value["daemon"]["running"], false);
     assert_eq!(value["daemon"]["mode"], "observe");
+    assert_eq!(
+        value["daemon"]["monitor_only"], false,
+        "F18 A1: a healthy fixture daemon is not latched"
+    );
     assert_eq!(value["fan"]["rpm"], 1200);
     assert_eq!(value["config"]["source"], "defaults");
 }
@@ -248,4 +267,8 @@ fn once_state_file_matches_afanctl_state_v1() {
     assert_eq!(state["target_rpm"], 1200);
     assert_eq!(state["last_written_rpm"], 1200);
     assert_eq!(state["verified"], true);
+    assert_eq!(
+        state["monitor_only"], false,
+        "F18 A1: a healthy once-write is not latched"
+    );
 }

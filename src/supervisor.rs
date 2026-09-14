@@ -50,10 +50,14 @@ pub enum SupError {
 
 /// Filesystem locations for the plugin-facing files (PRD R7/R8), both under
 /// `AFANCTL_RUNTIME_DIR` (default `/run/afanctl`) as resolved by main/cli.
+///
+/// RULING F18 (A4, N-F14-1): `config_source` carries the resolved global
+/// `--config` path so the startup evidence line can name it (was: absent).
 #[derive(Debug, Clone)]
 pub struct RuntimePaths {
     pub cmd: std::path::PathBuf,
     pub state: std::path::PathBuf,
+    pub config_source: std::path::PathBuf,
 }
 
 /// The supervisor: owns smc, controller, mode, L1 counters, and the
@@ -110,6 +114,9 @@ struct StateFile<'a> {
     last_written_rpm: Option<u32>,
     actual_rpm: Option<u32>,
     verified: bool,
+    /// RULING F18 (A1, additive): the monitor-only/degraded latch, visible to
+    /// the plugin. Additive field, schema id stays `afanctl.state.v1`.
+    monitor_only: bool,
     watchdog_pings: u64,
     recent_errors: &'a [RecentError],
 }
@@ -159,6 +166,7 @@ impl Supervisor {
             paths: RuntimePaths {
                 cmd: paths.cmd.clone(),
                 state: paths.state.clone(),
+                config_source: paths.config_source.clone(),
             },
             recent_errors: Vec::new(),
         })
@@ -302,9 +310,8 @@ impl Supervisor {
 
     /// One startup evidence line (RULING F14 observability): effective mode,
     /// L2 armed, watchdog notify path, config source, hw band — the journal
-    /// previously carried only systemd's lines. The Appendix-A `Supervisor`
-    /// never receives the config path, so the config field carries the state
-    /// file provenance it does hold (see DEVIATIONS.md F14).
+    /// previously carried only systemd's lines. RULING F18 (A4, N-F14-1):
+    /// `RuntimePaths.config_source` now supplies the resolved `--config` path.
     fn startup_evidence_line(&self, l2_armed: bool) {
         // Presence check only — never a side-effecting WATCHDOG ping.
         let watchdog_notify = std::env::var_os("NOTIFY_SOCKET").is_some();
@@ -313,6 +320,7 @@ impl Supervisor {
             l2_armed,
             watchdog_notify,
             state_file = %self.paths.state.display(),
+            config_source = %self.paths.config_source.display(),
             hw_band = format!("{}..{} rpm", self.hw_min, self.hw_max),
             "afanctl daemon startup"
         );
@@ -699,6 +707,7 @@ impl Supervisor {
             last_written_rpm: applied.or(self.last_written),
             actual_rpm: self.last_actual,
             verified,
+            monitor_only: self.monitor_only,
             watchdog_pings: self.watchdog_pings,
             recent_errors: &self.recent_errors,
         };
@@ -854,6 +863,7 @@ mod tests {
             RuntimePaths {
                 cmd: self.0.join("cmd.json"),
                 state: self.0.join("state.json"),
+                config_source: self.0.join("afanctl.toml"),
             }
         }
         fn write_cmd(&self, body: &str) {
@@ -989,6 +999,10 @@ mod tests {
             "state is published before the ping (binding poll order)"
         );
         assert_eq!(state["recent_errors"], serde_json::json!([]));
+        assert_eq!(
+            state["monitor_only"], false,
+            "healthy daemon is not latched"
+        );
         // Second poll: decision moves up the slew; the ping counter lands at 1.
         let before = sup.step_once();
         assert_eq!(before.applied_rpm, Some(2700));
@@ -1148,6 +1162,20 @@ mod tests {
         let state = dir.state();
         assert_eq!(state["mode"], "curve"); // commanded mode kept; degraded
         assert_eq!(state["verified"], false);
+        assert_eq!(
+            state["monitor_only"], true,
+            "the degradation latch must be visible in state.json (F17b)"
+        );
+        assert!(
+            state["recent_errors"]
+                .as_array()
+                .expect("recent_errors array")
+                .iter()
+                .any(|e| e["msg"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("monitor-only degradation"))),
+            "state.json must name the cause: {state}"
+        );
         // A fresh command content re-arms control (plugin retry story); the
         // same persisted file never does (freshness gate).
         dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":2500}"#);

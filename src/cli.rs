@@ -350,31 +350,41 @@ fn load_config(path: &std::path::Path) -> Result<(Config, Vec<String>), CliError
 }
 
 /// cmd/state file locations from the env-overridable runtime dir (Q-T6-2).
-fn runtime_paths() -> RuntimePaths {
+/// RULING F18 (A4): the resolved `--config` path rides along as
+/// `config_source` so the daemon's startup evidence line can name it.
+fn runtime_paths(config_source: &std::path::Path) -> RuntimePaths {
     let dir = runtime_dir();
     RuntimePaths {
         cmd: dir.join("cmd.json"),
         state: dir.join("state.json"),
+        config_source: config_source.to_path_buf(),
     }
 }
 
 /// Wire a supervisor over any backend. `Supervisor::new` validates the config
 /// band against the backend's hardware `(min, max)` rpm; `run()` installs L2
-/// and notifies READY.
+/// and notifies READY. `config_source` is the resolved global `--config` path
+/// (RULING F18 A4) carried into the startup evidence line.
 fn build_supervisor_with(
     smc: Box<dyn Smc>,
     config: &Config,
     start: RunMode,
+    config_source: &std::path::Path,
 ) -> Result<Supervisor, CliError> {
-    Supervisor::new(smc, &ResolvedConfig::from(config), start, &runtime_paths())
-        .map_err(|e| CliError::Runtime(e.to_string()))
+    Supervisor::new(
+        smc,
+        &ResolvedConfig::from(config),
+        start,
+        &runtime_paths(config_source),
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))
 }
 
 /// Build a live supervisor over the real sysfs backend (`--sysfs-root`).
 fn build_supervisor(globals: &Globals, start: RunMode) -> Result<Supervisor, CliError> {
     let (config, _warnings) = load_config(&globals.config)?;
     let smc = SysfsSmc::open(&globals.sysfs_root).map_err(|e| CliError::Runtime(e.to_string()))?;
-    build_supervisor_with(Box::new(smc), &config, start)
+    build_supervisor_with(Box::new(smc), &config, start, &globals.config)
 }
 
 fn run_daemon(mode: DaemonMode, globals: &Globals) -> i32 {
@@ -444,7 +454,8 @@ fn step_once_report(
         Some(c) => {
             let mut mock = MockSmc::new(config.min_rpm, config.max_rpm);
             mock.set_sensors(vec![simulated_reading(c)]);
-            let mut supervisor = build_supervisor_with(Box::new(mock), config, RunMode::Curve)?;
+            let mut supervisor =
+                build_supervisor_with(Box::new(mock), config, RunMode::Curve, &globals.config)?;
             Ok(supervisor.step_once())
         }
         None => live_once_report(config, globals),
@@ -460,7 +471,7 @@ fn live_once_report(config: &Config, globals: &Globals) -> Result<StepReport, Cl
     if let Some(fd) = smc.panic_fd() {
         crate::safety::install_death_path(fd);
     }
-    let step = build_supervisor_with(Box::new(smc), config, RunMode::Curve)
+    let step = build_supervisor_with(Box::new(smc), config, RunMode::Curve, &globals.config)
         .map(|mut supervisor| supervisor.step_once());
     match step {
         Ok(mut report) => {
@@ -651,6 +662,25 @@ struct StatusData {
     config: Config,
 }
 
+impl StatusData {
+    fn state_field(&self, key: &str) -> Option<&serde_json::Value> {
+        self.state.as_ref().and_then(|s| s.get(key))
+    }
+
+    /// RULING F18 (A1): the monitor-only/degraded latch from the state file.
+    fn monitor_only(&self) -> bool {
+        self.state_field("monitor_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    fn mode(&self) -> &str {
+        self.state_field("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("observe")
+    }
+}
+
 /// Gather the merged status: config provenance + direct sysfs reads (fan
 /// rpm/mode work even with the daemon down) + the state file if published.
 fn gather_status(globals: &Globals) -> Result<StatusData, CliError> {
@@ -691,7 +721,8 @@ fn status_json(d: &StatusData) -> serde_json::Value {
         // F7/D-T9-F7: Appendix B's `uptime_s` is approximated as
         // pings × interval_s (the state file stores a ping count, not
         // seconds; saturating multiply guards a pathological config).
-        "daemon": {"running": running, "mode": field("mode").and_then(|m| m.as_str()).unwrap_or("observe"), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
+        // RULING F18 (A1): `monitor_only` is additive; schema id stays v1.
+        "daemon": {"running": running, "mode": d.mode(), "monitor_only": d.monitor_only(), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
         "sensors": d.sensors.iter().map(|s| serde_json::json!({"label": s.label, "temp_c": s.milli_c.map_or(serde_json::Value::Null, temp)})).collect::<Vec<_>>(),
         "effective": {"temp_c": d.t_eff.map_or(serde_json::Value::Null, temp), "method": "max"},
         "fan": {"rpm": d.fan.rpm, "min_rpm": d.hw_min, "max_rpm": d.hw_max, "target_rpm": field("target_rpm").cloned().unwrap_or(serde_json::Value::Null), "manual": d.fan.mode == FanMode::Manual},
@@ -727,6 +758,15 @@ fn status_human(d: &StatusData) -> String {
             "not running"
         }
     ));
+    out.push_str(&format!(
+        "mode: {}{}\n",
+        d.mode(),
+        if d.monitor_only() {
+            " (monitor-only)"
+        } else {
+            ""
+        }
+    ));
     for sensor in &d.sensors {
         let reading = sensor
             .milli_c
@@ -745,6 +785,13 @@ fn status_human(d: &StatusData) -> String {
         d.hw_max,
         d.fan.mode == FanMode::Manual
     ));
+    match d
+        .state_field("target_rpm")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(rpm) => out.push_str(&format!("target: {rpm} rpm\n")),
+        None => out.push_str("target: n/a\n"),
+    }
     out.push_str(&format!(
         "config: high={} max={} min_rpm={} max_rpm={} interval_s={} source={}\n",
         d.config.high_c,
@@ -754,6 +801,24 @@ fn status_human(d: &StatusData) -> String {
         d.config.interval_s,
         d.source
     ));
+    match d
+        .state_field("recent_errors")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|errors| errors.last())
+    {
+        Some(err) => {
+            let ts = err
+                .get("ts")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let msg = err
+                .get("msg")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            out.push_str(&format!("recent_errors: {ts} {msg}\n"));
+        }
+        None => out.push_str("recent_errors: none\n"),
+    }
     out
 }
 
@@ -1038,9 +1103,13 @@ mod tests {
         let env = RuntimeEnv::new();
         let mut mock = MockSmc::new(1200, 7200);
         mock.set_sensors(vec![simulated_reading(80)]);
-        let mut supervisor =
-            build_supervisor_with(Box::new(mock), &Config::defaults(), RunMode::Curve)
-                .expect("supervisor builds over the mock");
+        let mut supervisor = build_supervisor_with(
+            Box::new(mock),
+            &Config::defaults(),
+            RunMode::Curve,
+            std::path::Path::new("/etc/afanctl/afanctl.toml"),
+        )
+        .expect("supervisor builds over the mock");
 
         let report = supervisor.step_once();
         assert_eq!(report.mode, RunMode::Curve);
@@ -1189,6 +1258,10 @@ mod tests {
         assert_eq!(value["schema"], "afanctl.status.v1");
         assert_eq!(value["daemon"]["running"], true);
         assert_eq!(value["daemon"]["mode"], "curve");
+        assert_eq!(
+            value["daemon"]["monitor_only"], false,
+            "F18 A1: healthy daemon reports the latch as false"
+        );
         assert_eq!(value["daemon"]["uptime_s"], 42, "pings × interval_s (1)");
         assert_eq!(value["fan"]["rpm"], 1200, "live sysfs read");
         assert_eq!(value["fan"]["min_rpm"], 1200);
@@ -1259,6 +1332,40 @@ mod tests {
             text.contains("fan: 1200 rpm (1200..7200, manual=false)"),
             "{text}"
         );
+    }
+
+    /// F18 A2: human status prints the commanded mode, the target and a
+    /// recent_errors line — including the monitor-only latch marker.
+    #[test]
+    fn status_human_prints_mode_target_and_recent_errors() {
+        let env = RuntimeEnv::new();
+        std::fs::write(
+            env.state(),
+            r#"{"schema":"afanctl.state.v1","mode":"curve","monitor_only":true,"target_rpm":3400,"recent_errors":[{"ts":"2026-09-14T15:02:11Z","msg":"L1 fallback: monitor-only degradation after repeated write failures"}]}"#,
+        )
+        .expect("seed state.json");
+        let data = gather_status(&globals(&fixture_root())).expect("gather");
+        let text = status_human(&data);
+        assert!(text.contains("mode: curve (monitor-only)"), "{text}");
+        assert!(text.contains("target: 3400 rpm"), "{text}");
+        assert!(
+            text.contains(
+                "recent_errors: 2026-09-14T15:02:11Z L1 fallback: monitor-only degradation"
+            ),
+            "{text}"
+        );
+        assert_eq!(status_json(&data)["daemon"]["monitor_only"], true);
+    }
+
+    /// F18 A2: with no daemon the new lines degrade to `n/a` / `none`.
+    #[test]
+    fn status_human_reports_unknown_target_and_no_errors_when_down() {
+        let _env = RuntimeEnv::new();
+        let data = gather_status(&globals(&fixture_root())).expect("gather");
+        let text = status_human(&data);
+        assert!(text.contains("mode: observe"), "{text}");
+        assert!(text.contains("target: n/a"), "{text}");
+        assert!(text.contains("recent_errors: none"), "{text}");
     }
 
     /// F2/D-T9-F2: the CLI forwards the parsed globals to doctor; the healthy

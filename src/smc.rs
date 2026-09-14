@@ -270,16 +270,21 @@ impl SysfsSmc {
         }
         let sensors = discover_sensors(root)?;
         // L2 death-path fd: O_WRONLY on fan1_manual, pre-opened once. On a
-        // read-only tree this degrades to None + loud log (doctor/status need
+        // read-only tree this degrades to None + debug log (doctor/status need
         // read-only opens); the supervisor decides whether a daemon may run
-        // without it (R4 policy is not this module's call).
+        // without it (R4 policy is not this module's call). RULING F18 (A3):
+        // callers that require the fd report the failure themselves (doctor
+        // FAIL/PASS, `Supervisor::run()`), so the discovery pre-open failure is
+        // debug-level, not a misleading WARN on the read-only path the polkit
+        // rule and the plugin use. Behavior (`panic_fd() == None`) is
+        // unchanged — no silent failure.
         let panic_file = match OpenOptions::new()
             .write(true)
             .open(fan_dir.join(FAN_MANUAL))
         {
             Ok(file) => Some(file),
             Err(source) => {
-                tracing::warn!(path = %fan_dir.join(FAN_MANUAL).display(), %source, "cannot pre-open fan1_manual O_WRONLY; L2 death path unavailable");
+                tracing::debug!(path = %fan_dir.join(FAN_MANUAL).display(), %source, "cannot pre-open fan1_manual O_WRONLY; L2 death path unavailable");
                 None
             }
         };
