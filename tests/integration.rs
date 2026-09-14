@@ -7,6 +7,7 @@
 //! runtime dir is a per-test `AFANCTL_RUNTIME_DIR` tempdir, never `/run`.
 //! The `hw` test only runs behind `--features hw` + `AFANCTL_HWTEST=1` +
 //! real applesmc, and skips cleanly otherwise (PRD §8).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
