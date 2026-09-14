@@ -238,6 +238,38 @@
   no public item added beyond the ruled constants). Package rebuilt 21:10.
 - [F20 — DISPATCHED] branch `fix/stall-and-auto` cut from the merged F19 tree; ticket rendered
   (`orchestration/instructions/F20.md`, 11.5 KB). This closes T9b's two MAJORs.
+- [F20 — MERGED + VERIFIED] branch `fix/stall-and-auto` (7fb9381) merged; gates green (152 tests). Scope
+  checked: `cli.rs` +12 is exactly the additive `auto_restore_pending` (JSON + human marker) that
+  RULING F20 R2 authorises; `degrade_to_auto` now emits the success message only on `Ok` and on `Err`
+  keeps `manual_armed`, sets `auto_restore_pending`, records attempts and retries every poll with a
+  rate-limited log. Regressions covered by dedicated tests: `f20_moving_command_frozen_tach_stall_fires`,
+  `f20_sustained_motion_healthy_fan_never_stalls`, `f20_failed_auto_restore_is_retried_truthfully`,
+  `f20_l2_absent_refuses_cmd_control`, `f20_stall_fires_exactly_at_stall_polls`,
+  `f20_off_target_dwell_warns_once_per_excursion`, `startup_evidence_line_names_config_source`,
+  plus `tests/pin_constants.rs` (echo-tolerance boundary 49/51, stall-at-exactly-10). README L1 section
+  rewritten to the real semantics + the foreign-owner and failed-AUTO paragraphs. Product LOC **+162**
+  (budget +250). Deviation N-F20-1 (LOC ledger) and QUESTION N-F20-1 (R3 implemented as the
+  startup-recorded `l2_absent` verdict instead of a per-poll re-check, because re-checking would break
+  the frozen `MockSmc::panic_fd() == None` semantics the mandated suite depends on; behaviourally
+  identical on the real backend and the cmd-file channel is now guarded) — **both ACCEPTED**. Orchestrator
+  also amended DESIGN.md's Appendix-B examples with the additive field. Package rebuilt 21:30.
+- [T9c — DISPATCHED] round-3 adversarial review of F19+F20 (`orchestration/instructions/T9c.md`), with an
+  explicit mandate to **falsify RULING F20 R1** (jittering-but-parked fan, SMC-clamped target, healthy
+  fan losing ground against a fast ramp) and to attack F19's settle window in the false-PASS direction.
+- [HW GATE (d) + (e) — PASS 2026-09-14 21:48] (d) soak: unit up **1 h 10 min**, 1.966 s CPU / 4211 s wall
+  (**0.05 %**, R11 budget <0.1 %), peak **2.4 MB** RSS (<5 MB), no errors. (e) the acceptance test that
+  had failed three times now passes end-to-end on hardware: `curve` ⇒ `fan1_manual == 1` in ≤3 s with
+  `mode: curve`, `target: 1200`, fan converging from 2005 rpm, `recent_errors: none`; SIGKILL ⇒ journal
+  `startup reconcile: previous process died without restoring AUTO … restoring AUTO now` then
+  `AUTO restored (fan1_manual=0, verified)`, readback `0`; `doctor`'s new stale-binary check PASSed.
+  Remaining: (f) soak + `--compare` (held until T9c clears) and (g) `hold 3000`.
+- [HW OBSERVATION — for the (f) judgement] with `curve` active at `t_eff` 61 °C our target is 1200 rpm
+  (quiet) while the SMC's own curve wanted ~6.6k rpm: the two controllers disagree by design (ours trusts
+  coretemp; the SMC's raw die sensors read ~10-15 °C hotter — e.g. 20:14 `TC0F` 63.5 C vs coretemp
+  package 48-51 C). coretemp is the authoritative CPU metric (the CPU throttles on its own DTS, Tjmax
+  100), so the design stands — but this is the input the user needs for the `--compare` decision, and
+  `max = 86` (full speed) maps to roughly Tjmax on the SMC's own scale. Option if the user wants margin:
+  lower `[thresholds].max` (e.g. 80) in `/etc/afanctl/afanctl.toml`; the file is pacman `backup=`-protected.
 - [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
   fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
   now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift
