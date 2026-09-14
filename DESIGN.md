@@ -48,7 +48,7 @@ pub enum SmcError {
     #[error("read {path}: {source}")] Read { path: std::path::PathBuf, source: std::io::Error },
     #[error("write {path}: {source}")] Write { path: std::path::PathBuf, source: std::io::Error },
     #[error("verify failed: wrote {wrote}, read back {read_back}")] VerifyFailed { wrote: u32, read_back: u32 },
-    #[error("invalid value from {path}: {0}")] InvalidValue { path: std::path::PathBuf, value: String },
+    #[error("invalid value from {path}: {value}")] InvalidValue { path: std::path::PathBuf, value: String },
 }
 
 pub trait Smc: Send {

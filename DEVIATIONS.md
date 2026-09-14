@@ -33,3 +33,11 @@ tree -i valuable` prints nothing). Direct dependencies are exactly the R11
 allowlist: `serde`, `toml`, `serde_json`, `thiserror`, `tracing`,
 `tracing-subscriber`, `libc`. No deviation, logged for the T9 allowlist audit.
 
+
+### RULING (orchestrator, 2026-09-14) on D1: ACCEPTED
+DESIGN.md amended accordingly (sole governance exception; the amended line is the
+binding contract going forward). Validated live: `{0}` fails to compile for a
+named-field variant, `{value}` compiles and renders identically. Propagation:
+T3/T7 instructions carry a RULINGS preamble noting this is already applied — no
+action needed by them. PRD.md §7 Appendix A left untouched (historical source;
+DESIGN.md is the binding contract per PLAN.md header).
