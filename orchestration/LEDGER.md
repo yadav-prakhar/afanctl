@@ -40,3 +40,10 @@
   once reaches verified SetSpeed against fixture. doctor stub exits 101 loudly (T7 owns body).
   LOC: supervisor.rs 1082 / smc.rs 887 / cli.rs 649 / config.rs 535 / policy.rs 336 — overages
   stop-and-reported by owners, deprioritized to T9 ruling.
+- [incident, orch-caused] A1 smoke ran release binary 'once' against the REPO fixture dir;
+  set_mode wrote fan1_manual=1 in the working tree → post-T6b-merge gates flipped RED with
+  3 phantom failures. Fixed by `git checkout -- tests/fixtures/sysfs/`. Lesson recorded:
+  orchestrator smokes must use tempdir copies (AFANCL_RUNTIME_DIR + copied fixture), never
+  the repo fixture path, with any verb that actuates.
+- [T6b MERGED] c0eaed4 (phase b wiring: daemon/once/hold real Supervisor, --at-temp, --dry-run,
+  hold clamp-before-write, doctor stub catch → exit 1). Post-fix main gates GREEN.
