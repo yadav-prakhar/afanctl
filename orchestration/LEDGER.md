@@ -143,6 +143,14 @@
   re-assert, not counted), `STALL_POLLS = 10` stall detector for a genuinely dead actuator, and fixtures
   gain tach-lag dynamics + the SMC-mirrors-its-own-target rule. P5 (f) marked BLOCKED until it lands.
 - [STATUS] Gate (e) not yet run (needs F14 reinstall, done) ; gate (f) blocked on F16; (d) soak unaffected.
+- [RULINGS — user approved 2026-09-14] (1) PRD amended in four places to match the frozen rulings:
+  §9.3e now names the startup reconcile (SIGKILL is uncatchable), R1 clarifies that read-back is of the
+  attribute just written (`fan1_input` is never a write-verification source), R4-L1 documents the split
+  checks + stall detector, Goal 2 notes uncatchable deaths are covered by the reconcile. (2) F18 bundle
+  approved (F15 + F17a + F17b + N-F14-1) → `orchestration/instructions/F18.md` rendered, held until F16
+  merges (same files: smc.rs/supervisor.rs/cli.rs). RULING F18 freezes: additive `monitor_only` field in
+  state.v1 + status.v1 (no id bump), human status gains mode/target/errors, smc pre-open WARN → debug,
+  `RuntimePaths.config_source` approved.
 - [DEFECT F17 (observability, not safety) — found while diagnosing F16] Two gaps, both in the
   plugin-facing surface (R7/R8): (a) human `status` prints daemon/sensors/t_eff/fan/config but **not
   mode, target_rpm or recent errors**, though README promises all three; (b) **nothing exposes the

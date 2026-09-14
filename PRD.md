@@ -67,7 +67,7 @@ Sysfs root: `/sys/devices/platform/applesmc.768/` (fan files directly there, **n
 **Goals**
 
 1. A single small Rust daemon + CLI that replaces the *need* for mbpfan on this machine, with none of its defect classes (C1/C2/H1/H2/H3 impossible by construction).
-2. **Fail-toward-AUTO as the universal failure policy**: every failure path — write failure, sensor loss, crash, hang, SIGKILL, start-limit storm, config error — ends with the SMC firmware back in charge, loudly logged.
+2. **Fail-toward-AUTO as the universal failure policy**: every failure path — write failure, sensor loss, crash, hang, SIGKILL, start-limit storm, config error — ends with the SMC firmware back in charge, loudly logged. (Uncatchable deaths — SIGKILL/OOM-kill — cannot run L2; the startup reconcile restores AUTO on the restart, R4.)
 3. Observability as a first-class feature: `status`, `status --json`, `doctor`, per-poll verification, structured runtime state file.
 4. A stable, minimal programmatic surface the omafan plugin can drive without root-adjacent hacks of its own.
 5. Buildable/testable **without touching real hardware** (fixture sysfs trees + mock backend); real-hw validation is a final, explicit, supervised gate.
@@ -92,7 +92,7 @@ Sysfs root: `/sys/devices/platform/applesmc.768/` (fan files directly there, **n
 ### R1 — Hardware interface (P0)
 
 - One module (`smc`) owns **all** sysfs knowledge: discovery of fan files and coretemp sensors (walk `/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp*_input` + `*_label`; the applesmc platform dir for `fan1_*`), path construction, reads, writes, retries. Nothing outside it contains a path string.
-- **Read-back-verify is a module invariant, not a feature:** every state-changing write (`fan1_output`, `fan1_manual`) is followed by a read-back within tolerance; logical state commits only on verified read-back; failed verification retries up to `K=3`, then surfaces an error upward (which triggers R4 fail-toward-AUTO). This kills mbpfan's silent-write-failure class (H6/M8) by construction.
+- **Read-back-verify is a module invariant, not a feature:** every state-changing write (`fan1_output`, `fan1_manual`) is followed by a read-back **of the attribute just written**, within tolerance; logical state commits only on verified read-back; failed verification retries up to `K=3`, then surfaces an error upward (which triggers R4 fail-toward-AUTO). `fan1_input` is the tachometer and is **never** a write-verification source — a fan that is still spinning down is not a failed write (ruling F16, DESIGN.md). This kills mbpfan's silent-write-failure class (H6/M8) by construction.
 - All rpm writes clamped to [`fan1_min`, `fan1_max`] read from hardware at discovery.
 - Sensor readings < 0 °C or > 120 °C are rejected as failed reads (outlier rejection).
 - `--sysfs-root <dir>` dev/test flag redirects *all* sysfs access (how the entire test suite and the plugin-facing integration tests run against fixtures).
@@ -124,7 +124,7 @@ Implemented in `policy.rs` — no I/O, no clock, no threads. One `Controller` st
 
 ### R4 — Safety layers (P0; the heart of the project)
 
-- **L1 — per-poll verify/re-assert:** every poll re-reads `fan1_manual` and `fan1_input`; if mode drifted or actual rpm deviates from last written by more than `VERIFY_TOLERANCE_RPM = 150`, re-assert; after `WRITE_FAIL_FALLBACK = 3` failed re-assertions, restore AUTO, degrade to monitor-only, log loudly.
+- **L1 — per-poll verify/re-assert:** every poll re-reads `fan1_manual` and `fan1_input`. Two checks with different consequences (ruling F16, DESIGN.md): **(a) mode drift** — the fan reads `Auto` while we believe we own it ⇒ re-assert `set_mode(Manual)`; only this, write-syscall errors and register-echo failures count toward `WRITE_FAIL_FALLBACK = 3` ⇒ restore AUTO, degrade to monitor-only, log loudly. **(b) tracking** — while armed and the command is unchanged, `|actual − last_written| > VERIFY_TOLERANCE_RPM = 150` ⇒ re-issue the write, but **never count it as a failure**: a fan that is still decelerating is not a broken fan. A genuinely unresponsive actuator is caught by the **stall detector**: command unchanged for `STALL_POLLS = 10` polls and the deviation has not shrunk ⇒ failure ⇒ AUTO + monitor-only.
 - **L2 — death path:** at startup pre-open an `O_WRONLY` fd on `fan1_manual`; a Rust panic hook plus raw `SIGSEGV/SIGABRT/SIGTERM/SIGINT` handlers perform exactly one async-signal-safe `write(fd, b"0")` — restoring AUTO and the firmware net in a single syscall. No allocation, no formatting, no locks, no path construction. A hidden `afanctl selftest-panic` verb panics deliberately; tests (fixture) and the supervised hardware gate verify AUTO afterwards. **If L2 cannot be made trustworthy, the answer is observe mode — the tool never needed to flip the mode.**
 - **L3 — systemd-first:** `Type=notify`, `WatchdogSec=15` (watchdog ping each poll; a hang gets SIGABRT → L2 → restart), `Restart=always`, `RestartSec=1`, `StartLimitIntervalSec=0` (crash-loops restart forever rather than exhausting into a dead fans-manual state — the corrected C1 mechanism), plus sandboxing (`ProtectSystem=strict`, `ReadWritePaths=/sys/devices/platform/applesmc.768`, `ProtectHome=yes`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, `RuntimeDirectory=afanctl`). Full unit in Appendix D.
 - **Sensor loss → AUTO** (R2) — fail toward the firmware, never drive on garbage.
@@ -453,7 +453,7 @@ Plus the task card's own checks. A task is done only when all gates pass in a cl
    b. `afanctl doctor --roundtrip` — manual 2 s → AUTO restore verified.
    c. `sudo afanctl selftest-panic` — process dies; `fan1_manual` reads 0; `doctor` confirms AUTO.
    d. `systemctl start afanctl` in observe mode — journal shows `READY` + watchdog armed; 30-min soak, zero errors; `status` reflects state file.
-   e. `SIGKILL` the daemon while in curve mode → restarts within ~1 s → L2 already restored AUTO → daemon resumes control; verify via `status` + journal.
+   e. `SIGKILL` the daemon while in curve mode → the unit restarts within ~1 s and the **startup reconcile** restores AUTO (a SIGKILL is uncatchable, so L2 cannot run — the restart is the mechanism that restores the firmware net); verify via `cat /sys/devices/platform/applesmc.768/fan1_manual` (expect `0`) + `status` + journal.
    f. (User-gated) `afanctl curve` + 1-hour soak; then `doctor --compare 600` for the empirical record.
    g. `afanctl hold 3000` from a user shell via the polkit rule — fan goes to ~3000, `doctor` warns hold active, overshoot guard verified by `once --at-temp` simulation (not by cooking the CPU).
 4. `makepkg -si` builds and installs cleanly on this machine; `systemctl enable` survives reboot test (machine boots with daemon in observe; fan on SMC curve).
