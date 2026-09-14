@@ -10,7 +10,7 @@
 //! (hwmon husk gaining fan attrs → warn); L2 fd armed.
 
 /// Run the doctor suite; returns process exit code (1 if any FAIL).
-pub fn run(roundtrip: bool, compare_secs: Option<u64>) -> i32 {
-    let _ = (roundtrip, compare_secs);
+pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32 {
+    let _ = (roundtrip, compare_secs, json);
     unimplemented!("owned by T7")
 }

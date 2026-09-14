@@ -145,6 +145,10 @@ pub fn install_death_path(panic_fd: i32);
 /// Deliberate panic for `selftest-panic` (proves L2; verified by fixture/hw tests).
 pub fn arm_test_panic() -> !;
 
+// ---- doctor.rs (diagnostics; read-only unless --roundtrip)
+pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32;
+//   json=true renders Appendix C output as JSON (same fields; R5 verb table).
+
 // ---- notify.rs (hand-rolled; no systemd crate)
 pub fn sd_ready() -> bool;             // READY=1
 pub fn sd_watchdog() -> bool;          // WATCHDOG=1

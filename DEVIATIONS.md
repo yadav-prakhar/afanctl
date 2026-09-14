@@ -41,3 +41,22 @@ named-field variant, `{value}` compiles and renders identically. Propagation:
 T3/T7 instructions carry a RULINGS preamble noting this is already applied — no
 action needed by them. PRD.md §7 Appendix A left untouched (historical source;
 DESIGN.md is the binding contract per PLAN.md header).
+
+### RULINGS (orchestrator, 2026-09-14) — Wave 1 adjudications
+
+- **D-T6-1 ACCEPTED:** `doctor::run` signature amended to `pub fn run(roundtrip: bool,
+  compare_secs: Option<u64>, json: bool) -> i32`. DESIGN.md updated (governance exception).
+  Root cause: PRD R5/Appendix C mandate `doctor --json` but Appendix A omitted the channel.
+  Propagation: T7 card carries the ruling; T6a's `run_doctor()` wired in PHASE (b).
+- **T3 N2 ACCEPTED (note):** `SysfsSmc::layout_changed(&self) -> bool` as an inherent
+  method is the sanctioned shape for the layout hook; T7 consumes it.
+- **T1 Q-T1-1 ACCEPTED as spec ruling:** a present config file with a missing key is
+  REFUSED (`ConfigError::Invalid` naming key+fix); only a wholly missing file falls back
+  to defaults. This is now the spec — T5/T7/T8 rely on it.
+- **T6 Q-T6-1 ACCEPTED as spec ruling:** `AFANCTL_RUNTIME_DIR` env seam is blessed for
+  T5/T8 (default `/run/afanctl`); doc it in README (T8) and use it in all integration tests.
+- **T6 Q-T6-2:** deferrals acknowledged — all land in PHASE (b) (T6b card unchanged).
+- **LOC overages (T1 config.rs 231, T3 smc.rs 553+334, T6 cli.rs ~650):** noted in ledger;
+  none trigger a bounce (mandated feature set; stop-and-report was honored).
+
+## Final Wave 1 status: all rulings propagated; DESIGN.md amended below.

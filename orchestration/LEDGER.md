@@ -5,10 +5,10 @@
 |----|-------|-------|--------|--------|------------|---------|----------|--------------|
 | S0 | bootstrap | glm-5.3 (orchestrator) | — | MERGED | 0 | 0 | 0 | (initial commit) |
 | T0 | scaffold+contracts | glm-5.3-flash/high | t0-scaffold | DISPATCHED | 1 | 0 | 0 | — |
-| T1 | config | deepseek-v4.1-flash | t1-config | PENDING | 0 | 0 | 0 | — |
-| T2 | policy | glm-5.3-flash/high | t2-policy | PENDING | 0 | 0 | 0 | — |
-| T3 | smc | glm-5.3-flash/high | t3-smc | PENDING | 0 | 0 | 0 | — |
-| T4 | safety+notify | glm-5.3-flash/high | t4-safety | PENDING | 0 | 0 | 0 | — |
+| T1 | config | deepseek-v4.1-flash | t1-config | DISPATCHED | 1 | 0 | 0 | — |
+| T2 | policy | glm-5.3-flash/high | t2-policy | DISPATCHED | 1 | 0 | 0 | — |
+| T3 | smc | glm-5.3-flash/high | t3-smc | DISPATCHED | 1 | 0 | 0 | — |
+| T4 | safety+notify | glm-5.3-flash/high | t4-safety | DISPATCHED | 1 | 0 | 0 | — |
 | T5 | supervisor | glm-5.3-flash/high | t5-supervisor | PENDING | 0 | 0 | 0 | — |
 | T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | PENDING | 0 | 0 | 0 | — |
 | T7 | doctor | deepseek-v4.1-flash | t7-doctor | PENDING | 0 | 0 | 0 | — |
