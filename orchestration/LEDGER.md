@@ -481,6 +481,22 @@ installed package at handoff is the 22:55 build.
  `recent_errors` message); exit code unchanged by WARNs (R5/Appendix C). Closes PRD §9.3g's unmet
  "doctor warns hold active" claim. Package rebuilt 02:02.
  - [STATUS] All tickets closed; 170 tests; final package built **02:02, Sep 15**. Remaining user-gated:
- ONE reinstall + restart (F24+F25 landed after the 23:29 install), optionally re-run the (f) soak to see
- `mode change:` lines in the journal, then `systemctl enable afanctl` + reboot test. Plan P5 items all
- ticked except the reboot line.
+ one reinstall + restart (F24+F25 landed after the 23:29 install), optionally re-run the (f) soak to see
+  `mode change:` lines in the journal, then `systemctl enable afanctl` + reboot test. Plan P5 items all
+  ticked except the reboot line.
+- [HW GATE FINAL PASS — orchestrator-run with user-granted passwordless sudo, 02:11–02:13, Sep 15]
+  (i) 02:02 package installed (`--noconfirm`), unit restarted, `doctor` = **10 checks, all PASS**,
+  NRestarts=0. (ii) F24 verified **live**: `sudo afanctl curve` ⇒ journal
+  `mode change: observe -> curve (arming on the control write this poll)` at 02:12:01; `pkexec afanctl
+  hold 3000` ⇒ `mode change: curve -> hold 3000 (fan1_manual=1 (already armed))`; `sudo afanctl observe`
+  ⇒ `mode change: hold 3000 -> observe (fan released to AUTO (fan1_manual=0, verified))`; readback `0`.
+  The soak-invisible defect is dead — every transition is now journalled. (iii) F25 verified **live**:
+  `doctor` during the hold printed the WARN
+  `hold active (3000 rpm, manual=true) — overshoot guard still applies; release with 'afanctl observe'`
+  with exit 0; after release, `PASS — daemon mode — mode: observe`. (iv) `systemctl enable afanctl` →
+  `enabled` (symlink in multi-user.target.wants); unit active, mode observe, firmware owns the fan,
+  61 polls / 121 watchdog pings, `recent_errors: []`, monitor_only/auto_restore_pending both false.
+- [REMAINING — the only step left, USER-only] **reboot**: after boot expect `systemctl is-active
+  afanctl` = active, `afanctl status` = observe (fan on the SMC curve at ~1.2k rpm). Everything else in
+  PRD §9.3/§9.4 is passed on hardware. The reboot is user-only because it terminates the orchestrator's
+  own session — it cannot verify a state it is not alive to see.
