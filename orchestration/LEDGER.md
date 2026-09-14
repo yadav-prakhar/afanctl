@@ -81,3 +81,11 @@
   NOT a defect — matches README "Root required (F11)"; both FAILs are the same permission cause, exit 1
   by design. PLAN.md P5 item (a) amended to say run elevated (orchestrator-owned doc). Re-run elevated;
   no code ticket opened. All other checks PASS (3 sensors, t_eff 54.0 C, fan 1200..7200, config defaults valid).
+- [HW GATE (a) attempt 2, root — PASS] 7 PASS + 1 expected WARN (unit not installed), exit 0.
+- [HW GATE (b) — PASS] `doctor --roundtrip` root: "manual+1200 rpm verified over 2 s; AUTO restored
+  (observed 1210 rpm / Manual)". Code-verified: the parenthetical is the during-hold snapshot read
+  BEFORE the restore; PASS requires restore Ok AND observed mode == Manual (src/doctor.rs:433). No defect.
+  Also confirmed by code: non-root `--roundtrip` refuses to write when `panic_fd()` is None.
+- [HW GATE (c) — PASS] `selftest-panic`: panic at src/safety.rs:81, exit 101; `/sys/.../fan1_manual` == 0
+  after → L2 death path proven on real hardware (the C1 defect class is dead).
+- [NOTE] P5 ordering: `d` needs the installed unit, so §9.4 `makepkg -si` must precede `d`; P5 annotated.

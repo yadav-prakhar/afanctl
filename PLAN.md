@@ -449,10 +449,10 @@ and anything you deliberately left for a later task.
 
 From PRD §9.3/§9.4 — the only real-sysfs session in the entire project. The orchestrator never runs these; it hands them over:
 
-- [ ] a. `sudo afanctl doctor` — all PASS, read-only. Do **not** run it as a plain user: the write-mode checks (`fan1_manual` writable, L2 fd armed) open the manual file `O_WRONLY`, so they FAIL by design without root (README "Root required (F11)"). `WARN` lines never block; the `systemd unit health — unit not installed` WARN is expected until `makepkg -si` in §9.4.
-- [ ] b. `afanctl doctor --roundtrip` — manual 2 s → AUTO restore verified.
-- [ ] c. `sudo afanctl selftest-panic` — process dies; `fan1_manual` reads 0; `doctor` confirms AUTO.
-- [ ] d. `systemctl start afanctl` (observe) — journal shows READY + watchdog armed; 30-min soak, zero errors; `status` reflects the state file.
+- [x] a. `sudo afanctl doctor` — **PASS 2026-09-14** (7 PASS + 1 expected WARN: unit not installed). Do **not** run it as a plain user: the write-mode checks (`fan1_manual` writable, L2 fd armed) open the manual file `O_WRONLY`, so they FAIL by design without root (README "Root required (F11)"). `WARN` lines never block; the `systemd unit health — unit not installed` WARN is expected until `makepkg -si` in §9.4.
+- [x] b. `sudo afanctl doctor --roundtrip` — **PASS 2026-09-14**: manual @ 1200 rpm verified over 2 s (observed 1210 rpm / Manual during the hold), AUTO restored. Non-root it refuses to write (no L2 fd) rather than writing manual — by design.
+- [x] c. `sudo afanctl selftest-panic` — **PASS 2026-09-14**: deliberate panic at `src/safety.rs:81`, exit 101; `fan1_manual` reads `0` afterwards.
+- [ ] d. `systemctl start afanctl` (observe) — **run §9.4's `makepkg -si` first: `d` needs the installed unit** (the unit-health WARN clears then). Journal shows READY + watchdog armed; 30-min soak, zero errors; `status` reflects the state file.
 - [ ] e. `SIGKILL` the daemon in curve mode → restarts within ~1 s → L2 already restored AUTO → daemon resumes; verify via `status` + journal.
 - [ ] f. (user-gated) `afanctl curve` + 1-hour soak; then `doctor --compare 600` for the empirical record.
 - [ ] g. `afanctl hold 3000` via the polkit rule from a user shell — fan ~3000, `doctor` warns hold active; overshoot guard verified by `once --at-temp` simulation.
