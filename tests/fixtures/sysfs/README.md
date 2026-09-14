@@ -26,3 +26,18 @@ Notes:
 - All tests run against THIS tree via --sysfs-root. Never write real /sys.
 - T3 completes this skeleton (more fixtures for fault injection as needed);
   T0 only creates the data files above.
+
+Fault-injecting fixture variants (added by T3; each is a full independent
+tree = copy of `devices/` with one fault applied — read faults too are
+committed trees; mutation-needing tests copy a tree to a tempdir first):
+
+  outlier_hi/       temp1_input = 125000          (> 120 °C outlier rejection)
+  outlier_neg/      temp2_input = -1000           (< 0 °C outlier)
+  empty_temp/       temp2_input = (empty)         (short/empty read)
+  garbage_temp/     temp3_input = "abc"           (unparseable sensor value)
+  garbage_fan/      fan1_input  = "12x4"          (InvalidValue on read_fan)
+  missing_fan/      applesmc.768 lacks fan1_input (NotFound at open)
+  no_coretemp/      no coretemp.0 platform dir    (NotFound at open)
+  layout_changed/   fan1_* moved INTO applesmc.768/hwmon/hwmon3/ (Q4 hwmon
+                    conversion happened; discovery walks and finds it,
+                    fan1_input = 3400 — exercises the layout-change hook)

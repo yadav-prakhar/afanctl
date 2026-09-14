@@ -52,3 +52,15 @@ plus the four `check_structural` rejections, each carrying `key` + `reason` +
 messages, so the table is walked by hand). No functionality was trimmed; no
 file other than `src/config.rs` grew. Flagged per §8 ("do not absorb silently")
 for the orchestrator's LOC audit.
+## T3 — smc
+
+### Q-T3-1: smc.rs LOC vs §7 budget (~230)
+
+Measured: 553 lines implementation + 334 lines co-located unit tests
+(`#[cfg(test)]`, mandated by the card's "+ unit tests" and §8 conventions)
+= 887 total. The ~230 budget (+20% → 276) is exceeded by the mandated
+feature set: two backends (SysfsSmc + MockSmc with full fault-injection
+surface per DESIGN's "scriptable ... faults, drift, latency"), discovery
+walks (Q4/Q5-proof), K=3 write-verify on both writers, outlier window, and
+the card-required layout hook. Reporting rather than absorbing silently;
+Nothing was cut to fit, and no public item drifted to save lines.
