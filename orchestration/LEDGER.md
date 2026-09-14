@@ -151,6 +151,22 @@
   merges (same files: smc.rs/supervisor.rs/cli.rs). RULING F18 freezes: additive `monitor_only` field in
   state.v1 + status.v1 (no id bump), human status gains mode/target/errors, smc pre-open WARN → debug,
   `RuntimePaths.config_source` approved.
+- [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
+  fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
+  now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift
+  (counted) from tracking (re-assert, explicitly uncounted) and adds the `STALL_POLLS` stall detector;
+  `MockSmc` gains `set_tach_lag`/`set_tach_frozen`/`set_write_stuck`. Tests present and matching the
+  ruling: hardware-event repro (6170 → 1200 with `write_failures == 0`, no fallback), takeover-by-echo,
+  frozen-fan stall, echo-not-taken via fault injection, mode drift, and the tracking-not-counted case.
+  Product-code delta measured at **+155 LOC** (budget +250). Package rebuilt 20:22 for reinstall.
+- [RULING N-F16-1 — ACCEPTED] stall detector degrades directly (loud error + AUTO + monitor-only at
+  `STALL_POLLS`) instead of riding the 3-strike ladder. Accepted: a stall is already a 10-poll confirmed
+  fault; stacking `WRITE_FAIL_FALLBACK` on top would delay the firmware net by ~30 s for no gain.
+- [RULING N-F16-2 — ACCEPTED] a static fixture tree cannot express "write not taken" now that
+  verification is the echo (the file holds what was written), so that case is fault-injected through
+  `MockSmc::set_write_stuck`; the lag/Auto-mirror dynamics live in `MockSmc` (`set_tach_lag`), and the
+  old `fixture_write_not_taking_fails_verify_after_k_retries` test — which encoded the F16 defect — was
+  rewritten as `fixture_write_verified_by_register_echo`. Correct reading of RULING R5.
 - [DEFECT F17 (observability, not safety) — found while diagnosing F16] Two gaps, both in the
   plugin-facing surface (R7/R8): (a) human `status` prints daemon/sensors/t_eff/fan/config but **not
   mode, target_rpm or recent errors**, though README promises all three; (b) **nothing exposes the
