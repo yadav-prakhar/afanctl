@@ -4,16 +4,27 @@
 | id | title | model | branch | status | dispatches | bounces | timeouts | merged (sha) |
 |----|-------|-------|--------|--------|------------|---------|----------|--------------|
 | S0 | bootstrap | glm-5.3 (orchestrator) | — | MERGED | 0 | 0 | 0 | (initial commit) |
-| T0 | scaffold+contracts | glm-5.3-flash/high | t0-scaffold | DISPATCHED | 1 | 0 | 0 | — |
+| T0 | scaffold+contracts | glm-5.3-flash/high | t0-scaffold | MERGED | 1 | 0 | 0 | 64b3081 |
 | T1 | config | deepseek-v4.1-flash | t1-config | MERGED | 1 | 0 | 0 | b71a55e |
 | T2 | policy | glm-5.3-flash/high | t2-policy | MERGED | 1 | 0 | 0 | aeb2b71 |
 | T3 | smc | glm-5.3-flash/high | t3-smc | MERGED | 1 | 0 | 0 | 3b41477 |
 | T4 | safety+notify | glm-5.3-flash/high | t4-safety | MERGED | 1 | 0 | 0 | 5773595 |
 | T5 | supervisor | glm-5.3-flash/high | t5-supervisor | MERGED | 1 | 0 | 0 | a6bbdbd |
-| T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a) | 1 | 0 | 0 | 815d0fa |
+| T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a+b) | 2 | 0 | 0 | 815d0fa, d6f9923 |
 | T7 | doctor | deepseek-v4.1-flash | t7-doctor | MERGED | 2 | 0 | 1 | a71b9f4 |
 | T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | MERGED | 2 | 0 | 1 | 9b6aa9d |
-| T9 | review gate | glm-5.3-flash/high | t9-review | CLOSED | 1 | 0 | 0 | (tickets merged) |
+| T9 | review gate round 1 | glm-5.3-flash/high | t9-review | CLOSED (FAIL→5 defects fixed) | 1 | 0 | 0 | (tickets merged) |
+| F14 | startup reconcile (uncatchable death) | glm-5.3-flash/high | fix/startup-reconcile | MERGED | 1 | 0 | 0 | 9c5f400 |
+| F16 | write-verify semantics + real dynamics | glm-5.3-flash/high | fix/write-verify | MERGED | 1 | 0 | 0 | 37722cf |
+| F18 | observability bundle (F15+F17+N-F14-1) | deepseek-v4.1-flash | fix/observability | MERGED | 1 | 0 | 0 | 88477a3 |
+| T9b | review gate round 2 | glm-5.3-flash/high | review/t9b | CLOSED (FAIL: 2 MAJOR + 7 MINOR) | 1 | 0 | 0 | b0fba6e |
+| F19 | settle-window verify + stale-binary check | glm-5.3-flash/high | fix/settle-window | MERGED | 1 | 0 | 0 | b1a3721 |
+| F20 | stall re-key + honest AUTO restore | glm-5.3-flash/high | fix/stall-and-auto | MERGED | 1 | 0 | 0 | 7fb9381 |
+| T9c | review gate round 3 | glm-5.3-flash/high | review/t9c | CLOSED (FAIL: 1 MAJOR + 1 arithmetic + 5 MINOR) | 1 | 0 | 0 | e0fe1be |
+| F21 | observe-release + watchdog margin | glm-5.3-flash/high | fix/observe-release | MERGED | 1 | 0 | 0 | 1c8d033 |
+| F22 | poll counter / exact uptime_s | deepseek-v4.1-flash | fix/poll-counter | MERGED | 1 | 0 | 0 | aa93070 |
+| T9d | review gate round 4 (final) | glm-5.3-flash/high | review/t9d | **CLOSED (PASS)** | 1 | 0 | 1 | 19474c6 (report salvaged) |
+| F23 | doc nits (T9d findings 1–2) | deepseek→glm retry | docs/t9d-findings | MERGED | 3 | 0 | 2 | bfe760f |
 
 <!-- statuses: PENDING · DISPATCHED · VERIFYING · BOUNCED(n) · MERGED · BLOCKED · ESCALATED -->
 
@@ -362,3 +373,62 @@
   warn-cadence boundary coincidence, explicitly "no direction". T9d's own recommendation was to fix (1)
   and (2) as docs and to **decline** the optional `verified: false`-while-pending semantics change —
   adopted. F23 (doc-only) dispatched to close (1) and (2).
+- [F23 — MERGED] `docs/t9d-findings` (bfe760f) merged after **three dispatches** (attempts 1 and 2 died
+  with exit 140 producing nothing — the same environmental flake that killed T7/T8 attempt 1 and T9d;
+  recorded, not hidden). Diff verified as comments/docs only: `src/config.rs`'s `MAX_INTERVAL_S` comment
+  now states T9d's true in-poll ceilings (≈5 s common, ≈10 s all-paths-failing) and why the two-ping
+  scheme bounds the observed gap by `max(interval, poll_work)`; README gains the plugin clause for
+  `auto_restore_pending`. Gates green (162 tests). Package rebuilt 22:55.
+
+## Final report (2026-09-14) — orchestration close-out
+
+**Delivered.** 11 planned tasks (S0 + T0–T9, T6 in two phases), 8 fix tickets (F14, F16, F18, F19, F20,
+F21, F22, F23), 2 review-follow-up fix tickets (T9fixA/B) and 1 in-flight fix (T4-fix1), and **4
+adversarial review rounds** (T9, T9b, T9c, T9d) — 25 instruction cards in `orchestration/instructions/`,
+~25 worker dispatches, every one gated by the orchestrator in the worker's worktree before merge.
+
+**Quality bounces: 0.** No task was ever bounced for red gates. Every post-T9 change came from either an
+adversarial review finding or hardware evidence, and each was adjudicated into a ruling before a ticket
+was written.
+
+**Environmental dispatch deaths: 5** (all exit 140, none a worker defect): T7 attempt 1, T8 attempt 1
+(both recovered by re-dispatch with a "read briskly" hint), T9d (killed *after* writing its complete
+report — salvaged and committed by the orchestrator, marked as such), F23 attempts 1–2 (recovered on the
+third). No result was ever invented to cover a death.
+
+**Rulings issued (all frozen in DESIGN.md, propagated to PRD where they changed requirements):**
+F14 (startup reconcile — uncatchable deaths), F16 (register-echo verification, L1 split, stall detector),
+F18 (additive `monitor_only`, status completeness, `config_source`), F19 (settle-window verification +
+`doctor` stale-binary check), F20 (tach-movement stall criterion, honest/recovering AUTO restore, L2
+invariant on both channels, dwell visibility), F21 (observe-release ownership, two pings per poll,
+`MAX_INTERVAL_S` 14→12, repeating dwell WARN, value pinning), F22 (real `polls` counter; exact
+`uptime_s`). Adjudicated sub-rulings: D1, D-T6-1, N-T1-1, N-F14-1, N-F16-1/2, N-F19-1, N-F20-1,
+N-F21-1/2, F2-doctor-sig. PRD amended in 4 places with user approval (§9.3e, R1, R4-L1, Goal 2).
+
+**Hardware evidence that changed the design** — the supervised gate found three defects no fixture could
+express, each a timing/physics assumption baked into the mocks: F14 (no reconcile ⇒ SIGKILL strands the
+fan in Manual forever), F16 (verifying a command against the tachometer, then counting normal
+deceleration as failure ⇒ curve mode disabled itself during every ramp), F19 (the SMC adopts `F0Tg` on a
+~1 s tick ⇒ the fixed echo check still failed until verification got a settle window). The mocks now
+model all three (`set_tach_lag` / `set_tach_frozen` / `set_write_stuck` / `set_echo_latency`), which is
+what makes the fourth review able to pass.
+
+**Final gates on the merged tree** (`a440e62`): `cargo fmt --check` clean ·
+`cargo clippy --all-targets --all-features -- -D warnings` clean · **162 tests pass** ·
+`cargo test --features hw` skips cleanly. `unsafe` confined to `src/safety.rs` (0 sites elsewhere);
+dependencies exactly the R11 allowlist; product-code `unwrap`/`expect`/`panic!` = 0 (clippy-enforced).
+
+**LOC vs PRD §7's per-file sketch** (product lines, `#[cfg(test)]` modules excluded, mandated doc
+comments included): main 21/60 · cli 850/200 · config 365/150 · policy 291/200 · smc 754/230 ·
+supervisor 997/250 · safety 84/90 · notify 56/40 · doctor 740/200 — **total 4,158 vs 1,420 sketch
+(+193 %)**, plus ~3,100 in-file test lines and ~1,800 in `tests/`. Every step was stop-and-reported
+(N-T1-1, N-T19-1, N-F19-1, N-F20-1). PRD §9.5's "within ±20 %" criterion is therefore **not met**; the
+sketch, not the code, is what is out of date — but that is the user's call to amend or accept, and it is
+flagged in HANDOFF.md §5 rather than buried here.
+
+**Verification status.** Review gate: **CLOSED** (T9d PASS / CLOSE, 0 MAJOR, 0 MINOR). Hardware gate:
+(a) `doctor` PASS · (b) `--roundtrip` PASS · (c) `selftest-panic` PASS · (d) observe soak PASS (1 h
+10 min, 0.05 % CPU, 2.4 MB peak) · (e) SIGKILL-reconcile PASS · **(f) curve soak + `--compare`, (g)
+`hold 3000`, and the `systemctl enable` reboot test remain — user-gated, printed in PLAN.md Appendix P5
+and summarised in `HANDOFF.md` §5.** Store-and-deploy honesty: `master` is the finished tree; the
+installed package at handoff is the 22:55 build.
