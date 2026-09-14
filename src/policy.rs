@@ -34,6 +34,16 @@ pub const SLEW_MAX_RPM_PER_POLL: u32 = 750;
 pub const SENSOR_LOSS_POLLS: u32 = 3;
 /// Consecutive polls with `t_eff >= max - 1` before bypassing slew to max (R2).
 pub const OVERSHOOT_POLLS: u32 = 3;
+/// RULING F16 (R4): echo tolerance for `fan1_output` write verification — the
+/// register we wrote is read back in the same poll and must hold the written
+/// value within this band ("was the write taken", mbpfan H6/M8 class).
+/// Consumed by `smc.rs`; `fan1_input` (the tachometer) is never a
+/// write-verification source.
+pub const WRITE_ECHO_TOLERANCE_RPM: u32 = 50;
+/// RULING F16 (R4): consecutive unchanged-command polls beyond which an
+/// actuator whose deviation has never decreased is declared unresponsive by
+/// the supervisor's stall detector (R3). Consumed by supervisor L1.
+pub const STALL_POLLS: u32 = 10;
 /// L1 drift tolerance: actual rpm deviating more than this from last written
 /// triggers re-assert (R4). Consumed by supervisor, declared here per PRD §7.
 pub const VERIFY_TOLERANCE_RPM: u32 = 150;
