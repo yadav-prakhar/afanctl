@@ -9,6 +9,7 @@
 //! real applesmc, and skips cleanly otherwise (PRD §8).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -166,6 +167,33 @@ fn state_mode(run_dir: &RunDir) -> Option<String> {
     let text = std::fs::read_to_string(run_dir.state()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("mode").and_then(|m| m.as_str()).map(str::to_owned)
+}
+
+/// The daemon's full published state, if readable.
+fn state_json(run_dir: &RunDir) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(run_dir.state()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// RULING F18 (A1): the monitor-only/degraded latch from the published state.
+fn state_monitor_only(run_dir: &RunDir) -> bool {
+    state_json(run_dir)
+        .and_then(|v| v.get("monitor_only").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// RULING F18 test 2: make `fan1_output` unwritable so the verified write
+/// fails. `chmod 0444` is the requested shape; when the runner is root
+/// (permission bits are ignored) fall back to a directory in the file's place,
+/// so the write syscall fails with EISDIR regardless of uid.
+fn make_unwritable(path: &Path) {
+    let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(path, perms).expect("chmod 0444");
+    if std::fs::write(path, b"0").is_ok() {
+        std::fs::remove_file(path).expect("remove file");
+        std::fs::create_dir(path).expect("replace with dir");
+    }
 }
 
 /// A spawned `daemon` process. Killed (SIGKILL) on drop as a backup; use
@@ -557,4 +585,133 @@ fn daemon_curve_reconciles_then_takes_control() {
     );
     assert!(daemon.term_and_wait(), "daemon must exit on SIGTERM");
     assert_eq!(fixture.read("fan1_manual"), "0", "L2 restored AUTO on exit");
+}
+
+// ---- F18: degraded-state observability + human status (RULING F18) ----
+
+/// F18 A1 (ticket test 1): `status --json` carries `daemon.monitor_only`, and
+/// a healthy fixture daemon reports it false.
+#[test]
+fn status_json_reports_monitor_only_false_for_healthy_daemon() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    assert!(
+        wait_until(|| state_json(&run_dir).is_some(), Duration::from_secs(5)),
+        "daemon must publish state.json"
+    );
+
+    let out = run(
+        &run_dir,
+        &[
+            "status",
+            "--json",
+            "--config",
+            cfg.to_str().expect("utf8 cfg"),
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(out.status.success(), "status must exit 0: {}", stderr(&out));
+    let value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("status --json stdout is JSON");
+    assert_eq!(value["daemon"]["running"], true);
+    assert_eq!(
+        value["daemon"]["monitor_only"], false,
+        "a healthy daemon must not report the degraded latch"
+    );
+    assert!(value["daemon"]["monitor_only"].is_boolean());
+}
+
+/// F18 A1/A2 (ticket test 2, the F17b regression): making the fixture's
+/// `fan1_output` unwritable for a spawned `daemon --mode curve` fails the
+/// verified write `WRITE_FAIL_FALLBACK` times ⇒ the state file reports
+/// `monitor_only: true` with the fallback cause in `recent_errors`, and human
+/// `status` marks the degraded mode (the display that misled a reader).
+#[test]
+fn curve_write_failure_degrades_and_status_marks_monitor_only() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    make_unwritable(&fixture.fan("fan1_output"));
+
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "curve");
+    let degraded = wait_until(|| state_monitor_only(&run_dir), Duration::from_secs(10));
+    if !degraded {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("daemon never latched monitor-only after write failures; log:\n{log}");
+    }
+    let state = state_json(&run_dir).expect("state.json");
+    assert_eq!(
+        state["mode"], "curve",
+        "commanded mode is kept while degraded (the F17b trap)"
+    );
+    assert_eq!(state["verified"], false);
+    assert!(
+        state["recent_errors"]
+            .as_array()
+            .expect("recent_errors")
+            .iter()
+            .any(|e| e["msg"]
+                .as_str()
+                .is_some_and(|m| m.contains("monitor-only degradation"))),
+        "the cause must stay visible in state.json: {state}"
+    );
+
+    let out = run(
+        &run_dir,
+        &[
+            "status",
+            "--config",
+            cfg.to_str().expect("utf8 cfg"),
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(out.status.success(), "status must exit 0: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("mode: curve (monitor-only)"),
+        "human status must mark the degraded state: {stdout}"
+    );
+    assert!(stdout.contains("recent_errors: "), "{stdout}");
+}
+
+/// F18 A2 (ticket test 3): human `status` prints the commanded mode, the live
+/// target rpm and a recent_errors line — fixture-backed.
+#[test]
+fn status_human_prints_mode_target_and_recent_errors() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "curve");
+    let controlled = wait_until(
+        || {
+            state_json(&run_dir)
+                .and_then(|v| v.get("target_rpm").and_then(serde_json::Value::as_u64))
+                == Some(1200)
+        },
+        Duration::from_secs(5),
+    );
+    if !controlled {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("curve daemon never published a target; daemon log:\n{log}");
+    }
+
+    let out = run(
+        &run_dir,
+        &[
+            "status",
+            "--config",
+            cfg.to_str().expect("utf8 cfg"),
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(out.status.success(), "status must exit 0: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mode: curve"), "{stdout}");
+    assert!(stdout.contains("target: 1200 rpm"), "{stdout}");
+    assert!(stdout.contains("recent_errors:"), "{stdout}");
 }
