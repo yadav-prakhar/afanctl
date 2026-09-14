@@ -13,7 +13,7 @@
 | T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a) | 1 | 0 | 0 | 815d0fa |
 | T7 | doctor | deepseek-v4.1-flash | t7-doctor | MERGED | 2 | 0 | 1 | a71b9f4 |
 | T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | MERGED | 2 | 0 | 1 | 9b6aa9d |
-| T9 | review gate | glm-5.3-flash/high | — (read-only) | PENDING | 0 | 0 | 0 | — |
+| T9 | review gate | glm-5.3-flash/high | t9-review | REPORTED | 1 | 0 | 0 | (report merged) |
 
 <!-- statuses: PENDING · DISPATCHED · VERIFYING · BOUNCED(n) · MERGED · BLOCKED · ESCALATED -->
 
@@ -53,3 +53,9 @@
   (tempdir fixtures, AFANCTL_RUNTIME_DIR), selftest-panic restores AUTO, packaging matches Appendix D.
 - [A2 PASS] audits re-run: unsafe confined; /sys confined; deps allowlist exact; product-code
   unwrap=0 (rechecked); .omo noise untracked+ignored via T8 chore commit.
+- [T9 VERDICT: FAIL — verified] F1 CRITICAL reproduced (once leaves fan1_manual=1, CODE=0);
+  F2 reproduced (doctor ignores --sysfs-root/--config — read live /sys at 70C vs fixture 45C);
+  F3 reproduced (interval_s=20 accepted, would starve WatchdogSec=15); F4 reproduced
+  (unwrap/expect/panic lints not enforced; 128 violations appear when flags added — all in tests);
+  F5 reproduced (negative thresholds → policy.rs:195 overflow panic in debug). Minors F6–F13 accepted
+  as reported by T9 (repro consistent with code), to be batched. Fix tickets F1–F5 + polish ticket next.
