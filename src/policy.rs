@@ -70,8 +70,10 @@ pub const STALL_TACH_EPSILON_RPM: u32 = 50;
 /// RULING F20 (R2): the failed-AUTO-restore retry log is rate-limited to one
 /// ERROR every this-many polls (the retry itself happens every poll).
 pub const AUTO_RETRY_LOG_POLLS: u32 = 10;
-/// RULING F20 (R4): off-target dwell after which one WARN per excursion is
-/// emitted (a fan hovering just outside tolerance must be visible).
+/// RULING F20 (R4) / F21 (R3): off-target dwell that triggers a WARN — and
+/// re-triggers every this-many polls while the excursion persists (a fan
+/// hovering just outside tolerance must stay visible, not warn once and go
+/// silent). Resets only on convergence or degradation.
 pub const OFF_TARGET_WARN_POLLS: u32 = 30;
 
 /// One control decision. Pure output of a `Controller` step. Every decision

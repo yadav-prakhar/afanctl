@@ -18,13 +18,18 @@ afanctl is built around the principle *fail toward the firmware*:
   verified write) is re-asserted and **never counted** — a fan still moving
   toward its command is not a broken fan. Only mode-drift re-assert failures,
   write-syscall errors and echo (write-verification) failures feed the
-  3-strike ladder to AUTO + monitor-only. A fan whose tach never moves toward
-  its command is caught by a separate stall detector, keyed on **tach
+  3-strike ladder to AUTO + monitor-only. A fan whose tach never moves
+  **between polls** is caught by a separate stall detector, keyed on **tach
   movement between polls** — a changing command (curve slew, mid-band
   oscillation) never resets the window — and degrades directly to AUTO +
   monitor-only after 10 motionless, off-target polls. A fan hovering just
-  outside the tolerance band is made visible by a warning after 30
-  off-target polls (no degradation).
+  outside the tolerance band is made visible by a warning after 30 off-target
+  polls that **repeats every 30 polls for as long as the excursion lasts**
+  (no degradation). Deliberate: the stall detector keys on *any* tach
+  movement, so a fan that jitters above the movement epsilon while parked
+  off target is reported — repeatedly — not degraded; a per-poll criterion
+  cannot separate "jittering but never converging" from "healthily chasing
+  without converging yet".
 - **L2 — death path.** At startup the daemon pre-opens an `O_WRONLY` fd on
   `fan1_manual`. A panic hook plus raw `SIGSEGV`/`SIGABRT`/`SIGTERM`/`SIGINT`
   handlers perform exactly one async-signal-safe `write(fd, b"0")` — restoring
@@ -41,11 +46,12 @@ afanctl is built around the principle *fail toward the firmware*:
   mbpfan — deliberate (RULING F14): one fan supervisor owns the fan; the
   firmware is always the fallback.
 - **Failed AUTO restore is never silent.** If a fallback's own AUTO restore
-  fails, the daemon stays in charge and re-attempts `set_mode(Auto)` every
-  poll (log rate-limited to once every 10) until a verified read-back confirms
-  AUTO; the pending state is exposed as `auto_restore_pending` in
-  `state.json` and `status --json`'s `daemon` object, and truthfully never
-  reports success before that.
+  fails — or an `observe` command's own release of a Manual fan fails — the
+  daemon stays in charge and re-attempts `set_mode(Auto)` every poll (log
+  rate-limited to once every 10) until a verified read-back confirms AUTO;
+  the pending state is exposed as `auto_restore_pending` in `state.json` and
+  `status --json`'s `daemon` object, and truthfully never reports success
+  before that.
 - **Invalid config → refuse to start.** A present-but-broken config never
   silently falls back to defaults; every error names the key and the fix.
 
@@ -133,8 +139,9 @@ min_rpm = 1200        # clamped to >= fan1_min at load
 max_rpm = 6200        # clamped to <= fan1_max at load
 
 [poll]
-interval_s = 1        # 1..=14; must stay below the unit's WatchdogSec=15
-                      # (one watchdog ping per poll — starving it crash-loops)
+interval_s = 1        # 1..=12; must stay well below the unit's WatchdogSec=15
+                      # (two watchdog pings per poll — start and end of each
+                      # one; starving it crash-loops)
 ```
 
 Semantics:
@@ -146,11 +153,12 @@ Semantics:
 - Validation rejects `high`/`max` outside the 0..=95 °C band (a fan
   controller's thresholds that can't reproduce a real temperature are a
   config error), `high >= max`, `min_rpm >= max_rpm`, `interval_s < 1` or
-  `interval_s >= 15` (the poll cadence carries the watchdog pings; a poll
-  period at or above the unit's `WatchdogSec=15` crash-loops the daemon),
-  and non-integer values, naming the offending key and the fix. The
-  watchdog bound is the compiled-in constant `config::MAX_INTERVAL_S`
-  (= 15 s − 1 s margin), mirroring `packaging/afanctl.service`.
+  `interval_s > 12` (the watchdog pings ride the poll — two per poll, at its
+  start and end — and the F19 settle windows block up to ≈2.7 s inside a
+  failing write; a poll period without ≥3 s of watchdog headroom
+  crash-loops the daemon), and non-integer values, naming the offending key
+  and the fix. The watchdog bound is the compiled-in constant
+  `config::MAX_INTERVAL_S`, mirroring `packaging/afanctl.service`.
 - Safety tunables (verify tolerance, sensor-loss polls, overshoot polls, slew
   rate, write-fail fallback, retry count) are compiled-in constants, not config.
 
