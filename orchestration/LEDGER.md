@@ -4,7 +4,7 @@
 | id | title | model | branch | status | dispatches | bounces | timeouts | merged (sha) |
 |----|-------|-------|--------|--------|------------|---------|----------|--------------|
 | S0 | bootstrap | glm-5.3 (orchestrator) | — | MERGED | 0 | 0 | 0 | (initial commit) |
-| T0 | scaffold+contracts | glm-5.3-flash/high | t0-scaffold | PENDING | 0 | 0 | 0 | — |
+| T0 | scaffold+contracts | glm-5.3-flash/high | t0-scaffold | DISPATCHED | 1 | 0 | 0 | — |
 | T1 | config | deepseek-v4.1-flash | t1-config | PENDING | 0 | 0 | 0 | — |
 | T2 | policy | glm-5.3-flash/high | t2-policy | PENDING | 0 | 0 | 0 | — |
 | T3 | smc | glm-5.3-flash/high | t3-smc | PENDING | 0 | 0 | 0 | — |
