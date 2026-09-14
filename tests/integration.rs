@@ -464,3 +464,97 @@ fn hw_guard_skips_without_hardware() {
     // Real-hardware assertions are added only in the supervised gate (§9.3);
     // this test exists to prove the triple guard compiles and skips cleanly.
 }
+
+// ---- F14: startup reconcile (RULING F14) ----
+
+/// F14: a fixture pre-set to `fan1_manual=1` (the SIGKILLed-predecessor state)
+/// is reconciled back to AUTO by the observe daemon's startup — within one
+/// poll `fan1_manual` reads `0` (R3: observe writes nothing after reconcile,
+/// so the restore is the only write the process ever makes).
+#[test]
+fn daemon_observe_reconciles_stale_manual_state() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    fixture.write("fan1_manual", "1");
+
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    let reconciled = wait_until(
+        || fixture.read("fan1_manual") == "0",
+        Duration::from_secs(5),
+    );
+    if !reconciled {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("observe daemon never reconciled fan1_manual=1 → 0; daemon log:\n{log}");
+    }
+    // Reconcile is idempotent: the healthy path writes nothing further.
+    assert_eq!(
+        fixture.read("fan1_output"),
+        "1200",
+        "observe writes no fan1_output (reconcile only restores the mode)"
+    );
+}
+
+/// F14: the `--mode curve` variant reconciles FIRST (the startup restore is
+/// logged before any control write), then takes control: `fan1_manual` ends
+/// at `1` with a real verified speed write — the reconcile must not eat the
+/// commanded mode. The `0` intermediate is a microseconds-wide window (the
+/// first poll follows reconcile immediately), so reconcile is asserted via
+/// the daemon's own journal/state evidence, not by racing the fixture file.
+#[test]
+fn daemon_curve_reconciles_then_takes_control() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    fixture.write("fan1_manual", "1");
+
+    let mut daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "curve");
+    // Control: first poll re-arms manual and writes the curve target (45 °C
+    // → SetSpeed(1200); the fixture input already sits at 1200, so verify the
+    // write via the state file's committed result, not an rpm delta).
+    let controlled = wait_until(
+        || {
+            fixture.read("fan1_manual") == "1"
+                && std::fs::read_to_string(run_dir.state())
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| {
+                        v.get("last_written_rpm")
+                            .and_then(|r| r.as_u64())
+                            .map(|r| r == 1200)
+                    })
+                    .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+    if !controlled {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("curve daemon never took control after reconcile; daemon log:\n{log}");
+    }
+    // Reconcile evidence: the startup restore ran (before control) and the
+    // state file carries it for `status --json` / the plugin.
+    let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+    assert!(
+        log.contains("startup reconcile: AUTO restored"),
+        "reconcile must restore AUTO before control; log:\n{log}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.state()).expect("state.json"))
+            .expect("json");
+    assert_eq!(
+        state["mode"], "curve",
+        "commanded mode survives the reconcile"
+    );
+    assert!(
+        state["recent_errors"]
+            .as_array()
+            .expect("recent_errors")
+            .iter()
+            .any(|e| e["msg"]
+                .as_str()
+                .is_some_and(|m| m.contains("stale manual mode restored to AUTO"))),
+        "reconcile recorded for the plugin: {state}"
+    );
+    assert!(daemon.term_and_wait(), "daemon must exit on SIGTERM");
+    assert_eq!(fixture.read("fan1_manual"), "0", "L2 restored AUTO on exit");
+}
