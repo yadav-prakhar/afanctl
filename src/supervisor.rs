@@ -192,9 +192,10 @@ impl Supervisor {
         }
     }
 
-    /// Foreground loop (systemd Type=notify, R4-L3): arms L2 (required for
-    /// any writing mode — without it we degrade to observe), notifies READY,
-    /// then step + sleep forever.
+    /// Foreground loop (systemd Type=notify, R4-L3): arms L2, reconciles any
+    /// stale manual state left by a killed predecessor, notifies READY, then
+    /// step + sleep forever (RULING F14: L2 → reconcile → sd_status/READY →
+    /// poll loop).
     pub fn run(&mut self) -> ! {
         if self.mode != RunMode::Observe && self.smc.panic_fd().is_none() {
             tracing::error!(
@@ -202,16 +203,103 @@ impl Supervisor {
             );
             self.mode = RunMode::Observe;
         }
+        let l2_armed = self.smc.panic_fd().is_some();
         if let Some(fd) = self.smc.panic_fd() {
             // INVARIANT: L2 armed before any control write can happen.
             crate::safety::install_death_path(fd);
         }
+        // RULING F14: reconcile BEFORE sd_status/READY — the SIGKILL restart
+        // is the mechanism that actually restores AUTO (an uncatchable signal
+        // cannot run L2), and it must complete before systemd marks us ready.
+        self.reconcile_stale_state();
+        self.startup_evidence_line(l2_armed);
         let _ = crate::notify::sd_status(&format!("mode={}", mode_name(&self.mode)));
         let _ = crate::notify::sd_ready();
         loop {
             self.step_once();
             std::thread::sleep(self.interval);
         }
+    }
+
+    /// Startup reconcile (RULING F14 / PRD R4 fail-toward-AUTO): a SIGKILLed
+    /// (or OOM-killed) predecessor cannot run L2, so the process may come up
+    /// with `fan1_manual == 1` and no safety net behind it. Read the fan:
+    /// `Manual` ⇒ log loudly, restore AUTO on the verified write path, and
+    /// record it for `status --json` / the plugin. A failed restore — or a
+    /// failed fan read while a writing mode is commanded — degrades to
+    /// observe + monitor-only: never command manual mode while AUTO cannot
+    /// be restored. `Auto` ⇒ nothing written (idempotent; no write on the
+    /// healthy path).
+    fn reconcile_stale_state(&mut self) {
+        let fan = match self.smc.read_fan() {
+            Ok(fan) => fan,
+            Err(e) => {
+                if self.mode != RunMode::Observe {
+                    let msg = format!(
+                        "startup reconcile: cannot read fan state: {e} (fix: check applesmc fan files are readable); degrading to observe + monitor-only: AUTO cannot be confirmed"
+                    );
+                    tracing::error!("{msg}");
+                    self.note_recent(msg);
+                    self.degrade_startup_to_observe();
+                } else {
+                    tracing::warn!(
+                        "startup reconcile: cannot read fan state: {e} (observe mode writes nothing; continuing without reconcile)"
+                    );
+                }
+                return;
+            }
+        };
+        if fan.mode == FanMode::Auto {
+            return; // healthy path: no write (reconcile is idempotent).
+        }
+        let msg = "startup reconcile: previous process died without restoring AUTO (fan1_manual=1; SIGKILL/OOM-kill cannot run L2); restoring AUTO now";
+        tracing::warn!("{msg}");
+        match self.smc.set_mode(FanMode::Auto) {
+            Ok(_) => {
+                self.manual_armed = false;
+                self.last_written = None;
+                self.note_recent(
+                    "startup reconcile: stale manual mode restored to AUTO".to_owned(),
+                );
+                tracing::info!("startup reconcile: AUTO restored (fan1_manual=0, verified)");
+            }
+            Err(e) => {
+                let msg = format!(
+                    "startup reconcile: restoring AUTO failed: {e} (fix: check fan1_manual writability as root); degrading to observe + monitor-only: never command manual while AUTO cannot be restored"
+                );
+                tracing::error!("{msg}");
+                self.note_recent(msg);
+                self.degrade_startup_to_observe();
+            }
+        }
+    }
+
+    /// Startup degradation latch (RULING F14 invariant): all writes off, mode
+    /// observe — the poll loop's monitor-only branch keeps it that way.
+    fn degrade_startup_to_observe(&mut self) {
+        self.mode = RunMode::Observe;
+        self.monitor_only = true;
+        self.manual_armed = false;
+        self.last_written = None;
+        self.write_failures = 0;
+    }
+
+    /// One startup evidence line (RULING F14 observability): effective mode,
+    /// L2 armed, watchdog notify path, config source, hw band — the journal
+    /// previously carried only systemd's lines. The Appendix-A `Supervisor`
+    /// never receives the config path, so the config field carries the state
+    /// file provenance it does hold (see DEVIATIONS.md F14).
+    fn startup_evidence_line(&self, l2_armed: bool) {
+        // Presence check only — never a side-effecting WATCHDOG ping.
+        let watchdog_notify = std::env::var_os("NOTIFY_SOCKET").is_some();
+        tracing::info!(
+            mode = %mode_name(&self.mode),
+            l2_armed,
+            watchdog_notify,
+            state_file = %self.paths.state.display(),
+            hw_band = format!("{}..{} rpm", self.hw_min, self.hw_max),
+            "afanctl daemon startup"
+        );
     }
 
     // ---- step 1: command file (R8) ----
@@ -746,6 +834,12 @@ mod tests {
         fn set_write_stuck(&self, read_back: Option<u32>) {
             self.smc().set_write_stuck(read_back);
         }
+        fn set_fan_read_fault(&self, kind: Option<std::io::ErrorKind>) {
+            self.smc().set_fan_read_fault(kind);
+        }
+        fn set_mode_read_back(&self, mode: Option<FanMode>) {
+            self.smc().set_mode_read_back(mode);
+        }
         fn write_attempts(&self) -> u32 {
             self.smc().write_attempts()
         }
@@ -1080,5 +1174,74 @@ mod tests {
         assert_eq!((y, m, d), (1970, 1, 1));
         let (y, m, d) = civil_from_days(20_710); // 2026-09-14 (per PRD era)
         assert_eq!((y, m, d), (2026, 9, 14));
+    }
+
+    // ---- F14 startup reconcile (RULING F14, ticket tests 1a–1d) ----
+
+    /// 1a: mock reports Manual at startup ⇒ exactly one set_mode(Auto),
+    /// no other write.
+    #[test]
+    fn reconcile_manual_restores_auto_with_a_single_verified_write() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(HW_MIN, FanMode::Manual); // SIGKILLed predecessor
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.reconcile_stale_state();
+        assert_eq!(sm.fan().mode, FanMode::Auto, "AUTO restored");
+        assert_eq!(
+            sm.write_attempts(),
+            1,
+            "exactly one set_mode(Auto), no other write"
+        );
+        assert!(!sup.monitor_only);
+        assert_eq!(sup.mode, RunMode::Observe);
+        assert!(!sup.recent_errors.is_empty(), "restored state recorded");
+    }
+
+    /// 1b: mock reports Auto ⇒ zero writes (no write on the healthy path).
+    #[test]
+    fn reconcile_auto_writes_nothing() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Curve, &dir);
+        sup.reconcile_stale_state();
+        assert_eq!(sm.write_attempts(), 0, "healthy path must not write");
+        assert_eq!(sup.mode, RunMode::Curve, "mode untouched");
+        assert!(!sup.monitor_only);
+    }
+
+    /// 1c: reconcile read fails while a writing mode is commanded ⇒ degrade
+    /// to observe + monitor_only.
+    #[test]
+    fn reconcile_read_failure_degrades_to_observe_monitor_only() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_read_fault(Some(std::io::ErrorKind::PermissionDenied));
+        let mut sup = supervisor(&sm, RunMode::Curve, &dir);
+        sup.reconcile_stale_state();
+        assert_eq!(sup.mode, RunMode::Observe);
+        assert!(sup.monitor_only);
+        assert_eq!(sm.write_attempts(), 0, "no write on an unconfirmable fan");
+    }
+
+    /// 1d: reconcile restore fails (fault-injected) ⇒ observe + monitor_only
+    /// + the loud error is logged (recent_errors carries it for status).
+    #[test]
+    fn reconcile_restore_failure_degrades_and_logs_loudly() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(HW_MIN, FanMode::Manual);
+        sm.set_mode_read_back(Some(FanMode::Manual)); // AUTO write never verifies
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.reconcile_stale_state();
+        assert_eq!(sup.mode, RunMode::Observe);
+        assert!(sup.monitor_only);
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("restoring AUTO failed")),
+            "loud error recorded: {:?}",
+            sup.recent_errors
+        );
     }
 }

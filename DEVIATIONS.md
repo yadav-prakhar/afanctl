@@ -229,3 +229,28 @@ already flagged over the §7 budget (N-T1-1). Same defect-fix scope as the
 card; nothing trimmed, no public item added beyond the two constants the
 card itself mandates (`WATCHDOG_UNIT_SEC`, `MAX_INTERVAL_S`). Reported, not
 absorbed silently (§8).
+
+## F14 — startup reconcile + startup evidence line (branch `fix/startup-reconcile`, 2026-09-14)
+
+### N-F14-1 (deviation, orchestrator call needed): evidence line cannot name the config source path
+
+- **Required by card:** the startup `tracing::info!` must name the *config
+  source path*.
+- **Blocker:** the Appendix-A signatures are frozen and `src/cli.rs` is
+  read-only for this ticket. `Supervisor::new(smc, cfg, start, paths)` receives
+  no config path; `RuntimePaths { cmd, state }` (also Appendix A) has no
+  config field; `cli::build_supervisor` is the only place that knows
+  `globals.config`. Any route to it — a `RuntimePaths` field, a
+  `Supervisor::new` parameter, or a new public setter — is a public-item
+  change plus a required one-line edit in a read-only file.
+- **Shipped instead:** the line names effective mode, L2 armed, watchdog
+  notify path, the daemon-owned `state_file` path, and the hw band. The
+  config-source field is **stopped** per the card's signature rule.
+- **Proposed change (old → new):** `RuntimePaths { cmd, state }` →
+  `RuntimePaths { cmd, state, config_source: PathBuf }`, populated by
+  `cli::runtime_paths()`/`build_supervisor` from `globals.config`; the
+  evidence line then logs `config_source = …`. Affected: DESIGN.md Appendix A,
+  `src/cli.rs` (two one-line edits), `src/supervisor.rs` (one field + one log
+  field). Defer to the orchestrator; until then the journal line is missing
+  that one field (P5 (e)/(f) evidence impact is minimal — config provenance is
+  still visible in `status --json`).
