@@ -56,11 +56,27 @@ fn send(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serializes all `$NOTIFY_SOCKET` env mutations across the parallel test
+    /// threads. The environment is process-global; without this lock one
+    /// test's `set_var`/`remove_var` can yank the socket path out from under
+    /// another test running concurrently, flaking `sd_watchdog()` assertions.
+    /// INVARIANT: a test must hold the lock from before its first env
+    /// mutation until after its final `sd_*` assertion.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Unset `$NOTIFY_SOCKET` → every verb is a no-op returning `false`
     /// (the R11 invariant).
     #[test]
     fn unset_socket_is_noop_false() {
+        let _guard = env_lock();
         std::env::remove_var("NOTIFY_SOCKET");
         assert!(!sd_ready());
         assert!(!sd_watchdog());
@@ -71,6 +87,7 @@ mod tests {
     /// `STATUS=…\n` datagrams.
     #[test]
     fn live_socket_receives_ready_and_status() {
+        let _guard = env_lock();
         let dir = std::env::temp_dir().join(format!("afanctl-t4-notify-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("notify.sock");
@@ -98,6 +115,7 @@ mod tests {
     /// listener bound to the same abstract name; no filesystem node involved.
     #[test]
     fn abstract_socket_form_reaches_listener() {
+        let _guard = env_lock();
         let name = format!("afanctl-t4-abs-{}", std::process::id());
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
         let listener = UnixDatagram::bind_addr(&addr).unwrap();
@@ -117,6 +135,7 @@ mod tests {
     /// notify invariant).
     #[test]
     fn dead_socket_returns_false() {
+        let _guard = env_lock();
         let dir = std::env::temp_dir().join(format!("afanctl-t4-dead-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("gone.sock");
