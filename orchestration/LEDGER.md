@@ -143,3 +143,11 @@
   re-assert, not counted), `STALL_POLLS = 10` stall detector for a genuinely dead actuator, and fixtures
   gain tach-lag dynamics + the SMC-mirrors-its-own-target rule. P5 (f) marked BLOCKED until it lands.
 - [STATUS] Gate (e) not yet run (needs F14 reinstall, done) ; gate (f) blocked on F16; (d) soak unaffected.
+- [DEFECT F17 (observability, not safety) — found while diagnosing F16] Two gaps, both in the
+  plugin-facing surface (R7/R8): (a) human `status` prints daemon/sensors/t_eff/fan/config but **not
+  mode, target_rpm or recent errors**, though README promises all three; (b) **nothing exposes the
+  monitor-only/degraded latch** — `afanctl.state.v1` keeps the *commanded* mode (`src/supervisor.rs`
+  test asserts `state["mode"] == "curve"` while degraded), so during the F16 event the plugin/user
+  would have rendered "curve" for a daemon that was doing nothing. Candidate bundle with F15 (WARN
+  noise) + N-F14-1 (RuntimePaths config_source): all touch cli.rs/supervisor.rs → dispatch AFTER F16
+  merges (same files, would conflict). Awaiting user go/no-go (scope, not safety).
