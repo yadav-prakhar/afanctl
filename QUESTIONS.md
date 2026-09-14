@@ -122,3 +122,59 @@ write-verified `set_mode` (R3), act/verify, L1 counter + fallback + freshness ga
 dependency allowed) and the Appendix-A required testable `StepReport`. Same class of overage as
 Q-T6-3 (`cli.rs` 650 vs 200). The alternative — thinning tests — violates §8 ("every behavioral
 claim must have a test"). Awaiting the planner's ruling (split? accept?).
+
+## T6 — cli + main (PHASE b)
+
+### Q-T6-2 RESOLVED — every PHASE-(a) deferral closed
+
+All three Q-T6-2 deferrals are implemented and tested (branch `t6-cli-phaseb`):
+
+- `once --at-temp <C>` routes the one-shot step through an in-process `MockSmc`
+  seeded with `MilliC::from_c(C)`. It never opens `--sysfs-root` (proved by
+  `once_at_temp_never_touches_sysfs`, which passes a nonexistent root). The
+  mock's hardware band is the configured curve band (`min_rpm..max_rpm`), since
+  reading the real `fan1_min/max` would require the sysfs the flag must avoid;
+  documented in `-h`.
+- `once --dry-run` computes the controller decision via `Controller::step_curve`
+  without constructing a Supervisor: no smc write, no `cmd.json`, no
+  `state.json` (`once_dry_run_writes_nothing`,
+  `once_dry_run_reads_fixture_without_writing`).
+- `hold <rpm>` now opens `SysfsSmc` first and clamps/rejects against the
+  discovered band BEFORE writing `cmd.json`: below `fan1_min` → exit 1 with a
+  key+fix message (`hold_rejects_below_fan1_min_and_writes_no_cmd`); above
+  `fan1_max` → clamped (`hold_clamps_above_fan1_max`); in-range written exactly
+  (`hold_within_range_writes_exact_rpm`).
+- `status` merge verified by `status_merges_state_file_and_sysfs_reads` /
+  `status_missing_state_file_reports_not_running`; `run_status` was split into
+  `gather_status` + `status_json`/`status_human` so the config + state + direct
+  sysfs merge and both renderings are directly testable.
+- `doctor` (T7 stub still `unimplemented!`) now maps the panic to
+  `doctor: not available yet (T7 pending)` on stderr + exit 1 via
+  `catch_unwind`; verified against the release binary (exit 1, never 101).
+
+### Q-T6-4: `once --json` grammar delta vs R5
+
+R5's verb table lists `--json` only for `status`/`doctor`; PHASE-(b) scope item 1
+mandates "'once' … prints the decision line (Appendix B human format; `--json`
+when flag present)". Implemented `once --json` as an additive verb flag (JSON
+object: `mode`/`t_eff_c`/`decision`/`applied_rpm`/`verified`/`notes`); the
+PHASE-(a) assertion that `once --json` was a usage error is updated in place.
+If R5 is authoritative and the flag must be refused, this is a one-line revert;
+flagged so the planner can rule.
+
+### N-T6-2 (note): `cli.rs` LOC after PHASE (b)
+
+`src/cli.rs` is now ~1160 lines (tests included) vs the §7 budget ~200. The
+growth over Q-T6-3's already-flagged ~650 is the mandated PHASE-(b) wiring (real
+Supervisor build, mock/dry-run one-shot paths, hold clamp/reject, status merge
+split, doctor catch) plus their required tests. Same class as Q-T6-3/Q-T5-3;
+reported, not absorbed silently (PLAN §2).
+
+### N-T6-3 (bug found + fixed in the owned file)
+
+PHASE-(b) status verification against the fixture exposed a PHASE-(a) display
+bug: human `status` used `format!("{:.1} C", temp_c(m))` although `temp_c`
+already returns a formatted `String`, so `{:.1}` truncated it (45.0 °C rendered
+as `4`). Fixed by interpolating directly (`"{} C"`), locked by
+`status_human_renders_full_temperatures`. JSON output was unaffected.
+
