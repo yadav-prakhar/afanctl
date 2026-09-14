@@ -347,3 +347,18 @@
   the review gate, a re-trace of every path that clears `manual_armed`, a recomputation of the watchdog
   margin at `interval_s = 12`, and a last sweep for remaining fixture-shaped assumptions (with what the
   hardware gate can and cannot cover). Package rebuilt 22:24.
+- [T9d — REVIEW GATE ROUND 4 (FINAL): **PASS / review gate CLOSE**] report merged
+  (`orchestration/REVIEW-T9d.md`, 480 lines). The agent's session was killed (exit 140) *after* it had
+  written the complete report but before committing; the orchestrator committed the untouched artifact
+  on its branch and merged it (salvage recorded here for honesty — the content is the reviewer's).
+  Verdict: **0 MAJOR, 0 MINOR, 3 INFORMATIONAL.** All F21/F22 rulings match and their tests genuinely
+  pin them (kill-analysis); every path that clears `manual_armed` was re-traced; the watchdog
+  arithmetic was recomputed from source; the F16/F19/F20 semantics are untouched (`src/smc.rs` is
+  byte-identical in the reviewed range). Informational: (1) the `MAX_INTERVAL_S` doc comment cites the
+  single-window worst case (≈2.7 s) instead of the true in-poll ceiling (≈5 s common, ≈10 s if all four
+  write paths fail) — the value 12 is still safe because the two pings bound the observed gap by
+  `max(interval, poll_work)`; (2) the README should say a plugin must read `auto_restore_pending` (the
+  `mode` may read `observe` while the fan is still Manual and the release is pending); (3) a cosmetic
+  warn-cadence boundary coincidence, explicitly "no direction". T9d's own recommendation was to fix (1)
+  and (2) as docs and to **decline** the optional `verified: false`-while-pending semantics change —
+  adopted. F23 (doc-only) dispatched to close (1) and (2).
