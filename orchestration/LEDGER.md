@@ -442,3 +442,27 @@ installed package at handoff is the 22:55 build.
   behaviour, schema or signature change. Ticket `orchestration/instructions/F24.md` dispatched. Note this
   finding is exactly the class the plan's sequencing guard predicts: the review gate can only review code
   that exists, and the hardware gate exercises paths the reviewers reasoned about but could not observe.
+ - [HW GATE (f) + (g) — PASS 2026-09-14 23:2x–23:4x, user-run] Evidence from the user's session (the
+ journal could not corroborate it — see F24 above; this is exactly what F24 fixes).
+ **(f)** soak ran clean: no errors, no fallback, `status` during curve showed `mode: curve`,
+ `target: 1200 rpm`, `manual=true`, fan 1174 rpm at `t_eff` 63 °C (below `high = 66` ⇒ our curve held
+ `min_rpm`). `doctor --compare 600`: **mean Δ 191 rpm, max |Δ| 2260, ours quieter 198 / louder 392 /
+ equal 10**. Characterisation by regime: at ≤ 64 °C ours ≈ the SMC within ±20 rpm (both ~1190–1220 —
+ the incumbent is *not* beaten at idle); during 1–2 s coretemp spikes (66–85 °C) ours ramps at the
+ 750 rpm/poll slew toward the linear target while the SMC stayed near 1.2k (its own sensors did not
+ register those spikes), giving the loud-side deltas up to ~2.2k. **Honest verdict: ours is more
+ responsive to coretemp and verifiable — not quieter.** Knobs if quiet is wanted: raise
+ `[thresholds].high`, lower `[curve].max_rpm`.
+ **(g)** `pkexec afanctl hold 3000` (polkit rule worked passwordlessly) ⇒ `mode: hold`, `target: 3000`,
+ fan 2980 rpm, `manual=true`, `recent_errors: none`; `sudo afanctl observe` released it. Two corrections
+ to the step as originally specified (both now in PRD §9.3g + PLAN P5): (i) `once --at-temp 86 --dry-run`
+ prints `SetSpeed(1950)` — the decision carries the slew-limited step and the overshoot guard needs
+ `OVERSHOOT_POLLS = 3` consecutive polls *inside one process*, while `once` is stateless, so the guard is
+ unreachable from the CLI and is proven by the policy trace tests instead; (ii) `doctor` had no
+ hold-active check at all (it never read the runtime state) — F25 adds it.
+ - [F25 — RULED + DISPATCHED] `doctor` gains one check, `daemon mode`, reading the same runtime state
+ `status` does: PASS for observe/curve, **WARN** for `hold` (naming the held rpm and the release command)
+ and for `monitor_only` / `auto_restore_pending` (naming the newest `recent_errors` message), PASS
+ "no running daemon" when the state file is absent; WARN never changes the exit code. Closes PRD §9.3g's
+ "doctor warns hold active" claim, which was unmet. Dispatched on `fix/doctor-mode` (deepseek) in
+ parallel with F24 — disjoint files (`src/doctor.rs` vs `src/supervisor.rs`).
