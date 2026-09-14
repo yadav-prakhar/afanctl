@@ -24,3 +24,31 @@ planner awareness; no dependency added. If unwanted, delete the section —
 nothing references it.
 
 *(no blocking questions; T0 proceeded on the unambiguous remainder)*
+
+---
+
+## T1 — config
+
+### Q-T1-1: semantics of a *present* config file with a missing key
+
+Appendix A does not say what happens when `/etc/afanctl/afanctl.toml` exists
+but omits one of the five keys. Two readings: (a) fill the missing key from its
+documented default, or (b) refuse the file. **Chosen: (b) refuse** — every key
+is required once a file is present; only a wholly *missing* file falls back to
+`defaults()` (PRD R6 qualifies defaults with "missing file"). This is the
+fail-safe reading for a thermal controller (a typo'd key can never silently
+select a different curve) and matches the module contract "never run on defaults
+after a bad edit". The unambiguous remainder is unaffected; no contract change.
+`from_toml`/`load` return `ConfigError::Invalid { key: "thresholds.max", … }`
+naming the missing key and the fix; a test locks it.
+
+### N-T1-1 (note, not a question): `src/config.rs` LOC vs the §7 budget
+
+§7 budgets `config.rs ~150`; this implementation is 231 non-comment product
+lines (298 including doc comments and blanks) — ~54% over. The overage is the
+mandated error surface itself: five keys × (missing / wrong-type / out-of-range)
+plus the four `check_structural` rejections, each carrying `key` + `reason` +
+`fix`, and the unknown-key warning walk (toml/serde derive cannot emit key+fix
+messages, so the table is walked by hand). No functionality was trimmed; no
+file other than `src/config.rs` grew. Flagged per §8 ("do not absorb silently")
+for the orchestrator's LOC audit.
