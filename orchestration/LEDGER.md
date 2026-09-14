@@ -224,6 +224,20 @@
   dwell (`OFF_TARGET_WARN_POLLS = 30`) becomes visible without degrading; (R5) README L1 + foreign-owner
   wording, constant-boundary pinning tests, evidence-line test. Ticket `orchestration/instructions/F20.md`
   rendered — **held until F19 merges** (same files: supervisor.rs/policy.rs/tests).
+- [F19 — MERGED] branch `fix/settle-window` (b1a3721) merged; gates green (143 tests, fmt/clippy clean,
+  `--features hw` guard skips). Orchestrator-verified: settle window implemented as
+  `ECHO_SETTLE_MS = 1500 / ECHO_SETTLE_SAMPLES = 10` (+ `MODE_SETTLE_MS = 1000`, `WRITE_RETRY_MAX = 1`)
+  in `policy.rs`, used by both backends in `smc.rs`; the µs retry ladder is gone; `MockSmc::set_echo_latency`
+  models adoption latency and the explicit regression test `echo_latency_is_accepted_not_a_failure`
+  asserts one write + no counted failure; `tests/settle_window.rs` test 1 **replays the measured hardware
+  event** (fan 6688 Manual, tach lag 3000, echo latency 300 ms ⇒ converges to 1200 with
+  `recent_errors == []`, `monitor_only == false`); test 2 covers "echo never adopted" ⇒ VerifyFailed +
+  fallback; `doctor` gains the stale-binary classifier (+ unit test). Deviation N-F19-1: product LOC
+  **+223 vs the +180 budget (24% over)** — stop-and-reported with drivers named (both mechanisms mandated
+  whole + §8-mandated invariant comments); accepted per the standing budget precedent (nothing trimmed,
+  no public item added beyond the ruled constants). Package rebuilt 21:10.
+- [F20 — DISPATCHED] branch `fix/stall-and-auto` cut from the merged F19 tree; ticket rendered
+  (`orchestration/instructions/F20.md`, 11.5 KB). This closes T9b's two MAJORs.
 - [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
   fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
   now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift
