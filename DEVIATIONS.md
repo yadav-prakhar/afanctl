@@ -254,3 +254,31 @@ absorbed silently (§8).
   field). Defer to the orchestrator; until then the journal line is missing
   that one field (P5 (e)/(f) evidence impact is minimal — config provenance is
   still visible in `status --json`).
+
+## F19 — settle-window verify + stale-binary doctor check (branch `F19`, 2026-09-14)
+
+### N-F19-1 (deviation, reported per card): product-code LOC over the +180 budget
+
+- **Card budget:** ≤ +180 product-code LOC (tests excluded). Measured: net
+  **+223** (policy.rs +14, smc.rs +113, doctor.rs +96; non-test lines only,
+  insertions − deletions vs the merge-base commit).
+- **Driver, not creep:** both new mechanisms are mandated whole —
+  (a) the settle-window write/verify rework (write-once, windowed echo
+  polling, single re-issue) touches *both* backends and adds the time-based
+  echo-adoption model the mock needs (`set_echo_latency`, per-invariant doc
+  comments §8 requires on safety-critical paths), and
+  (b) the doctor stale-binary check is a new checklist surface (systemctl
+  query, `date`-based local-time conversion because R11 forbids a tz crate,
+  mtime resolution with `/proc/<pid>/exe` → `/usr/bin/afanctl` fallback, pure
+  classifier). ~35% of the delta is mandated doc/invariant comments (§8:
+  public items + safety-critical lines get them).
+- **Nothing trimmed:** compacting further (single-letter closures, merged
+  branch arms in the settle/verify logic) was rejected — the borrow-light
+  explicit shape is what keeps `VerifyFailed` reporting and the
+  stale-echo-not-a-failure invariant auditable. F16/F16a semantics unchanged
+  (R4). Constants added are exactly the ones the card names plus
+  `WRITE_RETRY_MAX = 1` (R3's "re-issued once"), all next to the others in
+  `policy.rs`, not config.
+- **Per-file §7 check:** unchanged files are untouched; the three touched
+  files match their pre-task sizes plus the mandated additions. Reported
+  loudly, not absorbed (§8).
