@@ -160,6 +160,20 @@
   F17b regression test); human status renders mode/target/errors; schema tests cover both ids with the
   new field. README updated to match observed output (docs-vs-behavior). Product-code delta **+79 LOC**
   (budget +150). Package rebuilt 20:30.
+- [F19 — CANDIDATE, hardware evidence] F16's register-echo check **also** fails on this firmware:
+  after `sudo afanctl curve` (20:36:07) the journal shows `wrote=1200 read_back=2638` (stable across the
+  three microsecond-spaced retries) → 3 polls → monitor-only again (fan 7200 → SMC auto). So `curve`
+  still does not control on real hardware. Driver mapping confirmed from applesmc.c (the authoritative
+  source, not inference): `fan1_input` = `F0Ac` (actual, RO), **`fan1_output` = `F0Tg` (target, RW)**,
+  `fan1_manual` = bit 0 of `FS!` (16-bit mask), `fan1_min/max` = `F0Mn/F0Mx`. Live: auto ⇒ `F0Tg == F0Ac`
+  (7200/7205); during the failures `F0Tg` read *intermediate* values (6170 → 5235 → 1866; 2638) —
+  i.e. the SMC appears to **ramp** toward the commanded target and reports the in-progress value, so the
+  write is likely honored and the check is a *timing* error, not a value error: K=3 retries inside one
+  poll are microseconds apart, while the SMC's update cadence is ~1 s. Decisive experiment launched on
+  hardware (write manual=1 → target 2000 → watch `fan1_manual`/`fan1_output`/`fan1_input` for 15 s) to
+  distinguish (a) echo-with-settle-delay, (b) effect-only (F0Tg tracks the SMC's own ramp, never equals
+  the command), (c) manual bit not honored on this model. Ruling F19 waits on that data — no ticket
+  dispatched yet.
 - [PLAN CHANGE — orchestrator] T9b review dispatched: adversarial review of everything merged *after*
   the T9 gate (F14/F16/F18 + the four rulings), because the hardware gate found a class T9 could not see
   (fixture-shaped physics assumptions). Read-only, fresh context, no hardware tests.
