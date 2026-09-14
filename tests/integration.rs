@@ -1,15 +1,365 @@
-//! Integration tests (PRD R10, owned by T8): run the real binary with
-//! `--sysfs-root` against `tests/fixtures/sysfs/` — `once`, hold → cmd file →
-//! daemon applies, `selftest-panic` leaves fixture `fan1_manual == 0`, L1
-//! re-assert on induced drift.
+//! Integration tests (PRD R10, owned by T8): spawn the REAL binary
+//! (`env!("CARGO_BIN_EXE_afanctl")`, std::process::Command only — no
+//! assert_cmd) and drive it against a TEMPDIR COPY of `tests/fixtures/sysfs/`.
 //!
-//! T0 skeleton: no functional tests yet; this file exists so the gate runs
-//! and T8 fills it in place.
+//! Safety invariants: every actuating verb gets `--sysfs-root` at a tempdir
+//! copy (the repo fixture is NEVER mutated — one incident exists), and the
+//! runtime dir is a per-test `AFANCTL_RUNTIME_DIR` tempdir, never `/run`.
+//! The `hw` test only runs behind `--features hw` + `AFANCTL_HWTEST=1` +
+//! real applesmc, and skips cleanly otherwise (PRD §8).
 
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+/// Per-process monotonic counter so parallel tests never share tempdirs.
+fn unique_dir(tag: &str) -> PathBuf {
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("afanctl-t8-{tag}-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create tempdir");
+    dir
+}
+
+/// Absolute path to the freshly built binary (cargo sets this for integration
+/// tests of a binary target).
+fn binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_afanctl"))
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Recursive copy of a directory tree using `cp -a` (std has no recursive
+/// copy; `cp` is a system tool, not a crate dependency). `dst` must not exist.
+fn copy_tree(src: &Path, dst: &Path) {
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(src)
+        .arg(dst)
+        .status()
+        .expect("run cp");
+    assert!(
+        status.success(),
+        "cp -a {} {} failed",
+        src.display(),
+        dst.display()
+    );
+}
+
+/// A private writable copy of the fixture's `devices/` tree. Dropped (removed)
+/// at test end; the repo fixture is only ever read.
+struct Fixture {
+    dir: PathBuf,
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = unique_dir("fix");
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).expect("fixture root");
+        copy_tree(
+            &repo_root().join("tests/fixtures/sysfs/devices"),
+            &root.join("devices"),
+        );
+        Self { dir, root }
+    }
+
+    fn fan(&self, name: &str) -> PathBuf {
+        self.root.join("devices/platform/applesmc.768").join(name)
+    }
+
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.fan(name))
+            .unwrap_or_else(|e| panic!("read {}: {e}", name))
+            .trim()
+            .to_string()
+    }
+
+    fn write(&self, name: &str, value: &str) {
+        std::fs::write(self.fan(name), value).unwrap_or_else(|e| panic!("write {name}: {e}"));
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The per-test runtime dir where `cmd.json` / `state.json` live.
+struct RunDir {
+    dir: PathBuf,
+}
+
+impl RunDir {
+    fn new() -> Self {
+        Self {
+            dir: unique_dir("run"),
+        }
+    }
+    fn cmd(&self) -> PathBuf {
+        self.dir.join("cmd.json")
+    }
+    fn state(&self) -> PathBuf {
+        self.dir.join("state.json")
+    }
+    fn log(&self) -> PathBuf {
+        self.dir.join("daemon.log")
+    }
+}
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Run one shot of the real binary with `AFANCTL_RUNTIME_DIR` set, capturing
+/// stdout/stderr. Never inherits the parent env's runtime dir.
+fn run(run_dir: &RunDir, args: &[&str]) -> Output {
+    Command::new(binary())
+        .env("AFANCTL_RUNTIME_DIR", &run_dir.dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn afanctl")
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Write a valid config with a chosen poll interval (defaults otherwise).
+fn config(run_dir: &RunDir, interval_s: u64) -> PathBuf {
+    let path = run_dir.dir.join("afanctl.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[thresholds]\nhigh = 66\nmax = 86\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = {interval_s}\n"
+        ),
+    )
+    .expect("write config");
+    path
+}
+
+/// Poll `pred` every 50 ms until true or `timeout` elapses.
+fn wait_until(mut pred: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if pred() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The daemon's published mode, if `state.json` is readable.
+fn state_mode(run_dir: &RunDir) -> Option<String> {
+    let text = std::fs::read_to_string(run_dir.state()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("mode").and_then(|m| m.as_str()).map(str::to_owned)
+}
+
+/// A spawned `daemon` process. Killed (SIGKILL) on drop as a backup; use
+/// [`Daemon::term_and_wait`] to exercise the L2 SIGTERM path deliberately.
+struct Daemon {
+    child: Child,
+}
+
+impl Daemon {
+    fn spawn(run_dir: &RunDir, fixture: &Fixture, config: &Path, mode: &str) -> Self {
+        let log = std::fs::File::create(run_dir.log()).expect("daemon log");
+        let child = Command::new(binary())
+            .env("AFANCTL_RUNTIME_DIR", &run_dir.dir)
+            .args(["daemon", "--mode", mode, "--config"])
+            .arg(config)
+            .arg("--sysfs-root")
+            .arg(&fixture.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn daemon");
+        Self { child }
+    }
+
+    /// SIGTERM (not SIGKILL) so the L2 handler runs; returns true once the
+    /// process has exited (a signal death has no exit code), false on timeout.
+    fn term_and_wait(&mut self) -> bool {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -TERM {}", self.child.id()))
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `once`: one control iteration over the fixture copy prints the decision and
+/// actuates through the verify path (curve at 45 °C → SetSpeed(1200)).
 #[test]
-fn skeleton_integration_placeholder() {
-    // T8 owns: once decision output; hold→cmd→daemon applies; selftest-panic
-    // exits nonzero with fixture fan1_manual == 0; L1 re-assert on drift.
+fn once_prints_decision_and_actuates_verify_path() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let out = run(
+        &run_dir,
+        &[
+            "once",
+            "--config",
+            "/nonexistent/afanctl/afanctl.toml",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(out.status.success(), "once must exit 0: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("mode=curve"), "{stdout}");
+    assert!(stdout.contains("t_eff=45.0C"), "{stdout}");
+    assert!(stdout.contains("decision=SetSpeed(1200)"), "{stdout}");
+    assert!(stdout.contains("applied_rpm=1200"), "{stdout}");
+    assert!(stdout.contains("verified=true"), "{stdout}");
+    // The write-verify path committed: manual armed, output written.
+    assert_eq!(fixture.read("fan1_manual"), "1");
+    assert_eq!(fixture.read("fan1_output"), "1200");
+}
+
+/// `hold` writes `cmd.json` only (never sysfs); a spawned `daemon` then applies
+/// it within one poll — and SIGTERM exercises L2 (AUTO restored on the way out).
+#[test]
+fn hold_cmd_is_applied_by_daemon_within_one_poll() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    // One long poll: the daemon performs the first step immediately, then
+    // sleeps, so the assertions cannot race a second decision.
+    let cfg = config(&run_dir, 30);
+
+    let hold = run(
+        &run_dir,
+        &[
+            "hold",
+            "1300",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(hold.status.success(), "hold must exit 0: {}", stderr(&hold));
+    assert_eq!(
+        fixture.read("fan1_manual"),
+        "0",
+        "the CLI never touches sysfs"
+    );
+
+    let cmd: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.cmd()).expect("cmd.json"))
+            .expect("json");
+    assert_eq!(cmd["schema"], "afanctl.cmd.v1");
+    assert_eq!(cmd["mode"], "hold");
+    assert_eq!(cmd["rpm"], 1300);
+
+    let mut daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    let applied = wait_until(
+        || state_mode(&run_dir).as_deref() == Some("hold"),
+        Duration::from_secs(5),
+    );
+    if !applied {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("daemon never applied the queued hold; daemon log:\n{log}");
+    }
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.state()).expect("state.json"))
+            .expect("json");
+    assert_eq!(state["mode"], "hold");
+    assert_eq!(state["target_rpm"], 1300);
+    assert_eq!(state["last_written_rpm"], 1300, "verified write committed");
+    assert_eq!(fixture.read("fan1_manual"), "1");
+    assert_eq!(fixture.read("fan1_output"), "1300");
+
+    // L2 signal path: SIGTERM → single write(b"0") → AUTO.
+    assert!(daemon.term_and_wait(), "daemon must exit on SIGTERM");
+    assert_eq!(fixture.read("fan1_manual"), "0", "L2 restored AUTO");
+}
+
+/// `selftest-panic` exits nonzero AND the L2 panic hook writes AUTO to the
+/// fixture copy (PRD R4/§9.3c). The fixture starts at `1` so the `0` is
+/// evidence, not a coincidence.
+#[test]
+fn selftest_panic_exits_nonzero_and_restores_auto() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    fixture.write("fan1_manual", "1");
+    let out = run(
+        &run_dir,
+        &[
+            "selftest-panic",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(!out.status.success(), "the deliberate panic exits nonzero");
+    assert_eq!(
+        fixture.read("fan1_manual"),
+        "0",
+        "the L2 panic hook wrote b\"0\" (AUTO)"
+    );
+}
+
+/// L1 re-asserts manual mode after induced drift (R4), with no operator help.
+#[test]
+fn l1_reasserts_mode_drift() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+
+    let hold = run(
+        &run_dir,
+        &[
+            "hold",
+            "1200",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(hold.status.success(), "hold must exit 0: {}", stderr(&hold));
+
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    let armed = wait_until(
+        || fixture.read("fan1_manual") == "1" && state_mode(&run_dir).as_deref() == Some("hold"),
+        Duration::from_secs(5),
+    );
+    if !armed {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("daemon never armed the manual hold; daemon log:\n{log}");
+    }
+
+    // Induce mode drift: the firmware/SMC flips the fan back to AUTO.
+    fixture.write("fan1_manual", "0");
+    let restored = wait_until(
+        || fixture.read("fan1_manual") == "1",
+        Duration::from_secs(5),
+    );
+    assert!(restored, "L1 must re-assert manual mode after drift");
 }
 
 /// Proves the `--features hw` guard itself: without the feature this test
@@ -23,8 +373,7 @@ fn hw_guard_skips_without_hardware() {
     let applesmc_present = std::path::Path::new("/sys/devices/platform/applesmc.768").exists();
     if !(hwtest_enabled && applesmc_present) {
         eprintln!("skipping: hw tests require AFANCTL_HWTEST=1 and real applesmc (PRD §8)");
-    } else {
-        // Real-hardware assertions are added only in the supervised gate
-        // (§9.3). No test below this point may run without the triple guard.
     }
+    // Real-hardware assertions are added only in the supervised gate (§9.3);
+    // this test exists to prove the triple guard compiles and skips cleanly.
 }
