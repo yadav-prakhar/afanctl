@@ -466,3 +466,21 @@ installed package at handoff is the 22:55 build.
  "no running daemon" when the state file is absent; WARN never changes the exit code. Closes PRD §9.3g's
  "doctor warns hold active" claim, which was unmet. Dispatched on `fix/doctor-mode` (deepseek) in
  parallel with F24 — disjoint files (`src/doctor.rs` vs `src/supervisor.rs`).
+ - [F24 — MERGED] `fix/mode-logging` (9132322) merged; gates green (164 tests). Verified: `apply_mode`
+ emits one INFO line per real transition, `mode change: <prev> -> <new>` with the hold rpm and the
+ verified fan state (`fan1_manual=0/1, verified`); unchanged commands stay silent (freshness gate);
+ `run()` logs the report's remaining notes at DEBUG, and a healthy poll emits nothing. Integration
+ tests assert the daemon's captured log for all four lines (observe→curve, curve→hold 3000,
+ hold 3000→observe, and the no-change silence). Package rebuilt 02:02.
+ - [F25 — MERGED] `fix/doctor-mode` (fbee909, committing its own finished-but-uncommitted work on entry —
+ the agent's session had completed the change and run the gates before exiting without committing;
+ orchestrator committed in the worktree, then re-ran the gates) — merged; gates green (170 tests).
+ The check reads `state.json` the same way `status` does: PASS for observe/curve/"no running daemon",
+ **WARN** for `hold active (<rpm>/manual=true) — overshoot guard still applies; release with
+ 'afanctl observe'` and for `monitor_only=true`/`auto_restore_pending=true` (naming the newest
+ `recent_errors` message); exit code unchanged by WARNs (R5/Appendix C). Closes PRD §9.3g's unmet
+ "doctor warns hold active" claim. Package rebuilt 02:02.
+ - [STATUS] All tickets closed; 170 tests; final package built **02:02, Sep 15**. Remaining user-gated:
+ ONE reinstall + restart (F24+F25 landed after the 23:29 install), optionally re-run the (f) soak to see
+ `mode change:` lines in the journal, then `systemctl enable afanctl` + reboot test. Plan P5 items all
+ ticked except the reboot line.
