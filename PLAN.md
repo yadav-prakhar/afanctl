@@ -449,6 +449,8 @@ and anything you deliberately left for a later task.
 
 From PRD §9.3/§9.4 — the only real-sysfs session in the entire project. The orchestrator never runs these; it hands them over:
 
+**Discipline (learned the hard way): after every package reinstall, restart the unit and confirm the loaded build.** `sudo systemctl restart afanctl`, then check that the journal's startup evidence line is fresh (`ExecMainStartTimestamp` after the package's install time). A fresh install without a restart silently keeps testing the old binary — that cost one hardware round. F19 adds a `doctor` WARN for exactly this.
+
 - [x] a. `sudo afanctl doctor` — **PASS 2026-09-14** (7 PASS + 1 expected WARN: unit not installed). Do **not** run it as a plain user: the write-mode checks (`fan1_manual` writable, L2 fd armed) open the manual file `O_WRONLY`, so they FAIL by design without root (README "Root required (F11)"). `WARN` lines never block; the `systemd unit health — unit not installed` WARN is expected until `makepkg -si` in §9.4.
 - [x] b. `sudo afanctl doctor --roundtrip` — **PASS 2026-09-14**: manual @ 1200 rpm verified over 2 s (observed 1210 rpm / Manual during the hold), AUTO restored. Non-root it refuses to write (no L2 fd) rather than writing manual — by design.
 - [x] c. `sudo afanctl selftest-panic` — **PASS 2026-09-14**: deliberate panic at `src/safety.rs:81`, exit 101; `fan1_manual` reads `0` afterwards.

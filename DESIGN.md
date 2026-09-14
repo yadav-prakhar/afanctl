@@ -63,6 +63,12 @@ pub trait Smc: Send {
     /// counted) from tracking (re-assert only, never counted); a genuine unresponsive actuator is
     /// caught by the `STALL_POLLS` stall detector. Reason: on real hardware the previous
     /// semantics disabled control during every ramp (see F16 evidence in the ledger).
+    /// RULING F19 (orchestrator, 2026-09-14): the echo is verified inside a **settle window**
+    /// (`ECHO_SETTLE_MS = 1500`, sampled 10 × 150 ms; `MODE_SETTLE_MS = 1000` for `set_mode`)
+    /// because the SMC adopts `F0Tg` asynchronously on a ~1 s tick — measured on hardware:
+    /// write 2000 ⇒ target reads 2000 within ≤1 s, full-swing convergence ~5 s. One write per
+    /// window, no microsecond retries; `VerifyFailed` only when the window expires. `doctor`
+    /// additionally WARNs when the running daemon predates the installed binary (stale-build trap).
     fn write_speed(&mut self, rpm: u32) -> Result<u32, SmcError>;
     /// Write + read-back-verify. Returns the verified mode.
     fn set_mode(&mut self, mode: FanMode) -> Result<FanMode, SmcError>;

@@ -177,6 +177,26 @@
 - [PLAN CHANGE — orchestrator] T9b review dispatched: adversarial review of everything merged *after*
   the T9 gate (F14/F16/F18 + the four rulings), because the hardware gate found a class T9 could not see
   (fixture-shaped physics assumptions). Read-only, fresh context, no hardware tests.
+- [F19 — RULED (hardware-measured)] **The 20:36 failure was the stale F14 binary**, not F16: the daemon
+  had been running since 20:05:50 (F14 build, tach-based verify); the F16/F18 package was installed at
+  20:36 but the unit was not restarted until the SIGKILL at 20:37:11. So `read_back=2638` was
+  `fan1_input` (the tach descending toward 1200) under the *old* code — F16's echo check had never been
+  exercised on hardware. The 20:47 experiment then settled the semantics: with `manual=1`, writing
+  `F0Tg=2000` ⇒ target reads `2000` within ≤1 s and the fan converges `5875 → 2664 → 1632 → 1940 →
+  2044 → … → ~2000` (±20 rpm, small overshoot, ~5 s), and restoring auto ⇒ target `6229` (SMC's own).
+  Conclusion: `fan1_output` writes **are honored**, the echo is real, and the SMC updates `F0Tg`
+  **asynchronously on a ~1 s tick**. F16's defect is therefore a *timing* error: `VERIFY_ATTEMPTS = 3`
+  retries run microseconds apart against a register that has not ticked yet ⇒ false "write not taken"
+  ⇒ poll failures ⇒ monitor-only. RULING F19: (a) `write_speed`/`set_mode` verify inside a **settle
+  window** (`ECHO_SETTLE_MS = 1500`, 10 × 150 ms) — accept as soon as the register matches; one write
+  per window, no microsecond hammering; `VerifyFailed` only if the window expires; (b) keep F16's L1
+  split, stall detector and dynamics; (c) `MockSmc` gains `set_echo_latency` so the stale-echo case is a
+  **test** (the regression that hardware found); (d) `doctor` gains a **stale-binary check** (running
+  daemon's start time older than the installed binary's mtime ⇒ WARN "restart the unit") — this exact
+  confusion cost a hardware round. Ticket F19 dispatched.
+- [HW DYNAMICS — measured 2026-09-14 20:47, for the mock] full-swing response ≈ 3000 rpm/s downward
+  (6688→2664 in 1 s), ~5 s to settle, ±20 rpm steady-state, small overshoot (1626 → 1940 before
+  settling at ~2000). Mock lag defaults should reflect this, not the idealized 1500 rpm/poll sketch.
 - [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
   fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
   now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift
