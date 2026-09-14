@@ -282,3 +282,16 @@ absorbed silently (§8).
 - **Per-file §7 check:** unchanged files are untouched; the three touched
   files match their pre-task sizes plus the mandated additions. Reported
   loudly, not absorbed (§8).
+
+## F20 — stall detector re-key + honest AUTO restore + L2 invariant + dwell WARN (branch `fix/stall-and-auto`, 2026-09-14)
+
+### N-F20-1 (deviation, within budget): product-code LOC ledger
+
+- **Card budget:** ≤ +250 product-code LOC (tests excluded). Measured:
+  **+158 net** (supervisor.rs +138, policy.rs +10, cli.rs +10 — the additive
+  `auto_restore_pending` status field and its human marker).
+- No other files touched. `tests/pin_constants.rs` added (tests excluded from
+  the budget), superset of T9b finding 6's pinning ask.
+- Design note recorded in QUESTIONS.md `N-F20-1`: `l2_absent` is the
+  startup-verdict form of R3's guard — the literal per-poll recheck would
+  break the frozen MockSmc semantics (Appendix A) the suite is built on.

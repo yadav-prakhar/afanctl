@@ -674,6 +674,13 @@ impl StatusData {
             .unwrap_or(false)
     }
 
+    /// RULING F20 (R2, additive): the pending AUTO-restore flag.
+    fn auto_restore_pending(&self) -> bool {
+        self.state_field("auto_restore_pending")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn mode(&self) -> &str {
         self.state_field("mode")
             .and_then(serde_json::Value::as_str)
@@ -722,7 +729,7 @@ fn status_json(d: &StatusData) -> serde_json::Value {
         // pings × interval_s (the state file stores a ping count, not
         // seconds; saturating multiply guards a pathological config).
         // RULING F18 (A1): `monitor_only` is additive; schema id stays v1.
-        "daemon": {"running": running, "mode": d.mode(), "monitor_only": d.monitor_only(), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
+        "daemon": {"running": running, "mode": d.mode(), "monitor_only": d.monitor_only(), "auto_restore_pending": d.auto_restore_pending(), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
         "sensors": d.sensors.iter().map(|s| serde_json::json!({"label": s.label, "temp_c": s.milli_c.map_or(serde_json::Value::Null, temp)})).collect::<Vec<_>>(),
         "effective": {"temp_c": d.t_eff.map_or(serde_json::Value::Null, temp), "method": "max"},
         "fan": {"rpm": d.fan.rpm, "min_rpm": d.hw_min, "max_rpm": d.hw_max, "target_rpm": field("target_rpm").cloned().unwrap_or(serde_json::Value::Null), "manual": d.fan.mode == FanMode::Manual},
@@ -767,6 +774,9 @@ fn status_human(d: &StatusData) -> String {
             ""
         }
     ));
+    if d.auto_restore_pending() {
+        out.push_str("auto_restore_pending: true (AUTO restore pending)\n");
+    }
     for sensor in &d.sensors {
         let reading = sensor
             .milli_c

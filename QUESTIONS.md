@@ -316,3 +316,17 @@ defect itself and was rewritten as
 `fixture_write_verified_by_register_echo`. The lag/Auto-mirror modeling (R5)
 lives in `MockSmc` (`set_tach_lag` / `set_tach_frozen`); the static file tree
 is inert by nature and needs no dynamic rpm modeling for the required tests.
+
+### N-F20-1 (resolved-in-implementation): R3's literal `apply_mode` recheck of `panic_fd()` breaks the DESC-mandated mock semantics
+
+R3 reads "make `apply_mode` refuse writing modes when `panic_fd().is_none()`".
+Read literally, `apply_mode` re-checks the Smc every poll — but DESIGN.md
+Appendix A freezes `MockSmc::panic_fd() == None` for backends *without* a
+death path ("None if backend is a mock without one"), and hundreds of
+mandated tests drive `curve`/`hold` over such mocks. Implemented instead: the
+startup guard's verdict is recorded once on the supervisor
+(`l2_absent = panic_fd().is_none()` in `run()`) and `apply_mode` enforces it.
+Behaviorally identical on the real backend (the verdict can never change
+after startup); the invariant now holds on both channels — startup mode and
+cmd.json re-arming — which is R3's acceptance point. Flagged per the
+cross-agent protocol; unambiguous remainder implemented.
