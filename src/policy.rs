@@ -40,6 +40,20 @@ pub const OVERSHOOT_POLLS: u32 = 3;
 /// Consumed by `smc.rs`; `fan1_input` (the tachometer) is never a
 /// write-verification source.
 pub const WRITE_ECHO_TOLERANCE_RPM: u32 = 50;
+/// RULING F19 (R1): the echo settle window for `fan1_output` writes. The SMC
+/// adopts `F0Tg` asynchronously on a ~1 s tick (measured on hardware), so the
+/// echo is polled for `ECHO_SETTLE_MS` before the write may be re-issued.
+/// Consumed by `smc.rs`; safety tunable, not config.
+pub const ECHO_SETTLE_MS: u64 = 1500;
+/// RULING F19 (R1): sample count over the echo settle window (10 × 150 ms) —
+/// the poll cadence of the window; `ECHO_SETTLE_MS / samples` per read.
+pub const ECHO_SETTLE_SAMPLES: u32 = 10;
+/// RULING F19 (R2): the equivalent settle window for `fan1_manual` mode
+/// writes (exact 0/1 match, same sampling count as the echo window).
+pub const MODE_SETTLE_MS: u64 = 1000;
+/// RULING F19 (R3): a window-expired write is re-issued at most this many
+/// times (once), each with its own settle window; then `VerifyFailed`.
+pub const WRITE_RETRY_MAX: u32 = 1;
 /// RULING F16 (R4): consecutive unchanged-command polls beyond which an
 /// actuator whose deviation has never decreased is declared unresponsive by
 /// the supervisor's stall detector (R3). Consumed by supervisor L1.

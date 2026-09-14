@@ -17,7 +17,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -33,6 +33,12 @@ const DEFAULT_CONFIG: &str = "/etc/afanctl/afanctl.toml";
 const TJMAX_C: i32 = 100;
 /// Manual-mode hold duration for the `--roundtrip` write test (R5: 2 s).
 const ROUNDTRIP_HOLD: Duration = Duration::from_secs(2);
+/// Fallback binary path when `/proc/<MainPID>/exe` cannot be stat'ed
+/// (RULING F19 R6: stale-daemon detection on the packaged install).
+const FALLBACK_BINARY: &str = "/usr/bin/afanctl";
+/// Detail for the "cannot decide" stale-binary WARN (shared by the live
+/// check and the classifier).
+const STALE_UNKNOWN: &str = "cannot determine daemon start time or binary mtime (fix: check `systemctl show afanctl.service --property=MainPID,ExecMainStartTimestamp`)";
 /// JSON schema id for `doctor --json` (Appendix C "reuses the same fields").
 const SCHEMA: &str = "afanctl.doctor.v1";
 
@@ -226,6 +232,7 @@ fn diagnose(root: &Path, config_path: &Path) -> (Report, Option<SysfsSmc>) {
                 Some((backend.hw_min_rpm(), backend.hw_max_rpm())),
             ));
             checks.push(systemd_check());
+            checks.push(stale_binary_check());
             checks.push(if backend.layout_changed() {
                 Check::warn(
                     "applesmc layout unchanged",
@@ -261,6 +268,7 @@ fn diagnose(root: &Path, config_path: &Path) -> (Report, Option<SysfsSmc>) {
             ));
             checks.push(config_check(config_path, None));
             checks.push(systemd_check());
+            checks.push(stale_binary_check());
             checks.push(Check::warn(
                 "applesmc layout unchanged",
                 "unknown: discovery failed",
@@ -423,6 +431,94 @@ fn classify_systemd_show(text: &str) -> Check {
                 "Type={unit_type}, WatchdogUSec={watchdog} (fix: Appendix-D unit needs Type=notify + WatchdogSec=15)"
             ),
         )
+    }
+}
+
+/// Stale-binary check (RULING F19 R6, the 20:36 hardware lesson): compares
+/// the unit's `ExecMainStartTimestamp` with the running binary's mtime.
+fn stale_binary_check() -> Check {
+    let name = "running daemon matches installed binary";
+    let show = Command::new("systemctl")
+        .args([
+            "show",
+            "afanctl.service",
+            "--property=MainPID,ExecMainStartTimestamp",
+            "--no-pager",
+        ])
+        .output();
+    let text = match show {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => {
+            return Check::warn(
+                name,
+                format!(
+                    "systemctl exited {} (stale-binary check unknown)",
+                    out.status
+                ),
+            )
+        }
+        Err(e) => return Check::warn(name, format!("systemctl unavailable: {e}")),
+    };
+    let pid = system_field(&text, "MainPID").and_then(|v| v.parse::<u32>().ok());
+    if pid.is_none_or(|p| p == 0) {
+        return Check::pass(name, "daemon is not running (nothing can be stale)");
+    }
+    classify_stale_binary(
+        system_field(&text, "ExecMainStartTimestamp").and_then(timestamp_epoch),
+        running_binary_mtime(pid),
+    )
+}
+
+/// One `key=value` field from `systemctl show` output (None = missing/empty).
+fn system_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let v = text
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))?
+        .trim();
+    (!v.is_empty()).then_some(v)
+}
+
+/// Timestamp to epoch via GNU `date` (no tz parsing dependency allowed by
+/// R11): `date` resolves the unit's local-time abbreviation (e.g. `IST`).
+fn timestamp_epoch(text: &str) -> Option<i64> {
+    let out = Command::new("date")
+        .args(["-d", text.trim(), "+%s"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Mtime of the running binary: `/proc/<MainPID>/exe` target, falling back
+/// to the packaged `/usr/bin/afanctl` (when the proc link cannot be stat'ed).
+fn running_binary_mtime(pid: Option<u32>) -> Option<i64> {
+    let exe = pid.filter(|p| *p != 0).map(|p| format!("/proc/{p}/exe"))?;
+    std::fs::metadata(&exe)
+        .or_else(|_| std::fs::metadata(FALLBACK_BINARY))
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+/// Pure stale-binary classifier (unit-tested without systemd, root, or
+/// hardware): daemon start before the binary's mtime = WARN — restart the
+/// unit (never a FAIL); unknown either side = WARN (cannot decide).
+fn classify_stale_binary(started: Option<i64>, mtime: Option<i64>) -> Check {
+    let name = "running daemon matches installed binary";
+    match (started, mtime) {
+        (Some(start), Some(mtime)) if start < mtime => Check::warn(
+            name,
+            "running daemon predates the installed binary — restart the unit (systemctl restart afanctl)",
+        ),
+        (Some(_), Some(_)) => {
+            Check::pass(name, "daemon started at/after the installed binary's mtime")
+        }
+        _ => Check::warn(name, STALE_UNKNOWN),
     }
 }
 
@@ -1026,6 +1122,44 @@ mod tests {
         assert_eq!(simple.status, Status::Fail);
         let missing = classify_systemd_show("LoadState=not-found\n");
         assert_eq!(missing.status, Status::Warn);
+    }
+
+    /// RULING F19 (R6) test 5: stale-binary classifier on fixture epochs —
+    /// unit start older than the binary mtime ⇒ WARN naming the restart fix;
+    /// fresh start ⇒ PASS; unknown either side ⇒ WARN (never a FAIL).
+    #[test]
+    fn stale_binary_classification() {
+        let stale = classify_stale_binary(Some(1000), Some(2000));
+        assert_eq!(stale.status, Status::Warn);
+        assert!(
+            stale
+                .detail
+                .contains("restart the unit (systemctl restart afanctl)"),
+            "{}",
+            stale.detail
+        );
+        let fresh = classify_stale_binary(Some(2000), Some(2000));
+        assert_eq!(fresh.status, Status::Pass);
+        let unknown = classify_stale_binary(Some(1000), None);
+        assert_eq!(unknown.status, Status::Warn);
+        assert!(unknown.detail.contains("cannot determine"));
+    }
+
+    /// The `systemctl show` field extraction used by the stale check.
+    #[test]
+    fn system_field_extraction() {
+        let text = "MainPID=4711\nExecMainStartTimestamp=Mon 2026-09-14 20:47:09 IST\n";
+        assert_eq!(system_field(text, "MainPID"), Some("4711"));
+        assert_eq!(
+            system_field(text, "ExecMainStartTimestamp"),
+            Some("Mon 2026-09-14 20:47:09 IST")
+        );
+        assert_eq!(system_field(text, "AbsentBootId"), None);
+        // Empty value (daemon not running) is treated as absent.
+        assert_eq!(
+            system_field("MainPID=0\nLoadState=loaded\n", "MainPID"),
+            Some("0")
+        );
     }
 
     /// JSON rendering carries the schema id and the same check fields.
