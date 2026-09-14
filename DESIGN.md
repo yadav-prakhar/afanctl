@@ -193,7 +193,7 @@ pub fn sd_status(msg: &str) -> bool;   // STATUS=…
 ```json
 {
   "schema": "afanctl.status.v1",
-  "daemon": { "running": true, "mode": "curve", "monitor_only": false, "watchdog_armed": true, "uptime_s": 981 },
+  "daemon": { "running": true, "mode": "curve", "monitor_only": false, "auto_restore_pending": false, "watchdog_armed": true, "uptime_s": 981 },
   "sensors": [ { "label": "Core 0", "temp_c": 53.0 } ],
   "effective": { "temp_c": 53.0, "method": "max" },
   "fan": { "rpm": 1203, "min_rpm": 1200, "max_rpm": 7200, "target_rpm": 1200, "manual": false },
@@ -210,7 +210,7 @@ pub fn sd_status(msg: &str) -> bool;   // STATUS=…
 ```json
 { "schema": "afanctl.state.v1", "ts": "…", "mode": "curve", "t_eff_c": 71.2,
   "target_rpm": 3400, "last_written_rpm": 3350, "actual_rpm": 3390,
-  "verified": true, "monitor_only": false, "watchdog_pings": 981, "recent_errors": [ … last 5 … ] }
+  "verified": true, "monitor_only": false, "auto_restore_pending": false, "watchdog_pings": 981, "recent_errors": [ … last 5 … ] }
 ```
 
 ### Appendix C — doctor output (human; `--json` reuses the same fields)
