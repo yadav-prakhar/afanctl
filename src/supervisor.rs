@@ -106,6 +106,11 @@ pub struct Supervisor {
     /// Raw content of the last applied command; freshness gate for cmd.json.
     last_cmd: Option<String>,
     watchdog_pings: u64,
+    /// RULING F22: completed polls since this daemon started (0), advanced
+    /// exactly once per `step_once`. Distinct from `watchdog_pings`, which
+    /// moves twice per poll (start + end ping, F21 R2) and is the L3 audit
+    /// trail; `polls` is the uptime source for `status --json`.
+    polls: u64,
     paths: RuntimePaths,
     /// Last 5 errors for `state.json` / `status` (R7 recent_errors).
     recent_errors: Vec<RecentError>,
@@ -137,6 +142,9 @@ struct StateFile<'a> {
     /// Schema id stays `afanctl.state.v1` (F18 precedent).
     auto_restore_pending: bool,
     watchdog_pings: u64,
+    /// RULING F22 (additive): completed polls since daemon start, one per
+    /// `step_once`. Never conflate with `watchdog_pings` (two per poll, L3).
+    polls: u64,
     recent_errors: &'a [RecentError],
 }
 
@@ -185,6 +193,7 @@ impl Supervisor {
             hw_max: hw.1,
             last_cmd: None,
             watchdog_pings: 0,
+            polls: 0,
             paths: RuntimePaths {
                 cmd: paths.cmd.clone(),
                 state: paths.state.clone(),
@@ -233,7 +242,10 @@ impl Supervisor {
         // INVARIANT: verified reports the failure verdict this poll; a
         // monitor-only degraded supervisor reports false even when idle.
         let verified = !self.monitor_only && l1_ok;
-        // 5. state.json publish (R7).
+        // 5. state.json publish (R7). RULING F22: this poll is now complete,
+        // so advance the poll counter exactly once, before publishing, so the
+        // published `polls` (and `uptime_s`) includes it.
+        self.polls += 1;
         self.publish_state(&decision, applied, verified);
         // 6. watchdog ping (L3). step_once never sleeps: the loop does.
         self.ping_watchdog();
@@ -252,6 +264,9 @@ impl Supervisor {
     /// step + sleep forever (RULING F14: L2 → reconcile → sd_status/READY →
     /// poll loop).
     pub fn run(&mut self) -> ! {
+        // RULING F22: uptime counts from this daemon's start, so the
+        // completed-poll counter begins at 0 here (never loaded from disk).
+        self.polls = 0;
         // RULING F20 (R3): record the L2 prerequisite on the supervisor itself
         // so `apply_mode` upholds the invariant on the cmd-file channel too.
         self.l2_absent = self.smc.panic_fd().is_none();
@@ -890,6 +905,7 @@ impl Supervisor {
             monitor_only: self.monitor_only,
             auto_restore_pending: self.auto_restore_pending,
             watchdog_pings: self.watchdog_pings,
+            polls: self.polls,
             recent_errors: &self.recent_errors,
         };
         let body = serde_json::to_string(&state);
@@ -1189,12 +1205,14 @@ mod tests {
             state["monitor_only"], false,
             "healthy daemon is not latched"
         );
+        assert_eq!(state["polls"], 1, "RULING F22: one completed poll");
         // Second poll: decision moves up the slew; the ping counter lands
         // at 2·2−1 = 3 (two pings per poll, publish between them).
         let before = sup.step_once();
         assert_eq!(before.applied_rpm, Some(2700));
         assert!(before.verified);
         assert_eq!(dir.state()["watchdog_pings"], 3);
+        assert_eq!(dir.state()["polls"], 2, "RULING F22: two completed polls");
     }
 
     /// Card check: observe startup never writes (firmware owns the fan, R3).
@@ -1950,6 +1968,31 @@ mod tests {
         assert_eq!(dir.state()["watchdog_pings"], 3, "poll 2: 2·2−1");
         sup.step_once();
         assert_eq!(dir.state()["watchdog_pings"], 5, "poll 3: 2·3−1");
+    }
+
+    /// RULING F22 test 1: `polls` advances exactly once per completed poll
+    /// while `watchdog_pings` advances twice (start + end ping, F21 R2) —
+    /// asserted together so the two counters cannot silently swap meanings.
+    #[test]
+    fn f22_polls_once_per_poll_and_pings_twice() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        for n in 1..=3u64 {
+            sup.step_once();
+            assert_eq!(
+                dir.state()["polls"],
+                n,
+                "after {n} step_once calls the published poll count is {n}"
+            );
+            assert_eq!(
+                sup.watchdog_pings,
+                2 * n,
+                "after {n} completed polls the watchdog has been pinged twice each"
+            );
+        }
+        assert_eq!(sup.watchdog_pings, 2 * sup.polls);
     }
 
     /// RULING F21 (R2) consequence: even a poll blocked on slow smc work

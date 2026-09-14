@@ -213,6 +213,17 @@ and `recent_errors` names the cause. Human `status` renders this as
 `mode: curve (monitor-only)`. A plugin must render the latch, not the mode
 alone.
 
+`state.json` also carries `polls` — the number of completed polls since the
+daemon started, one per poll (additive field; the `v1` schema ids are
+unchanged). `status --json`'s `daemon.uptime_s` is exactly
+`polls × poll.interval_s`. This is deliberately separate from the L3 audit
+field `watchdog_pings`, which advances **twice** per poll (a ping at the start
+and the end, RULING F21 R2) and is never used for uptime. A `state.json`
+written by a daemon older than this build has no `polls`, so `uptime_s`
+transiently falls back to the old `watchdog_pings × interval_s` estimate
+(correct for that build, where there was one ping per poll); that fallback is
+the compatibility path only.
+
 | Preset | Command |
 |---|---|
 | auto | `afanctl observe` |
