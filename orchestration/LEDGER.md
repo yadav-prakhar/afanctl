@@ -500,3 +500,14 @@ installed package at handoff is the 22:55 build.
   afanctl` = active, `afanctl status` = observe (fan on the SMC curve at ~1.2k rpm). Everything else in
   PRD §9.3/§9.4 is passed on hardware. The reboot is user-only because it terminates the orchestrator's
   own session — it cannot verify a state it is not alive to see.
+- [HW GATE — **COMPLETE**. Reboot test PASSED 2026-09-15 02:17, verified by orchestrator after the
+  user's reboot] unit **enabled** and **active (running)** since boot (Main PID 776), `Status:
+  "mode=observe"`, NRestarts=0 with WatchdogUSec=15s armed; startup evidence line in the `-b` journal
+  (observe, l2_armed=true); `doctor` all PASS post-boot; `fan1_manual = 0`, fan 1216 rpm on the SMC
+  curve; `status` = observe, `recent_errors: none`; state file healthy (235 polls / 469 pings, both
+  latch flags false). PRD §9.3 (a–g) and §9.4 are now **fully discharged on hardware**: the machine
+  boots into observe with the firmware in charge, always. Project status: **deployed and accepted**.
+- [ACCEPTANCE DENOTATION — user decision recorded in HANDOFF.md §5] PRD §9.5's LOC criterion remains
+  unmet-as-specified (4,158 product lines vs the 1,420-line §7 sketch); the sketch was pre-build, the
+  increases were each stop-and-reported, and the user has been asked to amend or accept. All other §9.5
+  levers (safety confinement, dep allowlist, mechanical gates) hold.
