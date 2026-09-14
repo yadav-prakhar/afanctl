@@ -294,3 +294,32 @@
   would have rendered "curve" for a daemon that was doing nothing. Candidate bundle with F15 (WARN
   noise) + N-F14-1 (RuntimePaths config_source): all touch cli.rs/supervisor.rs → dispatch AFTER F16
   merges (same files, would conflict). Awaiting user go/no-go (scope, not safety).
+- [T9c — REVIEW GATE ROUND 3: **FAIL** (1 MAJOR + 1 arithmetic + 5 MINOR)] report merged
+  (`orchestration/REVIEW-T9c.md`, 364 lines). Method: live probes on fixture copies + read-only hardware
+  sampling (20 × 1 Hz `fan1_input` deltas **0–26 rpm** — half of `STALL_TACH_EPSILON_RPM = 50`).
+  **RULING F20 R1 survived its falsification mandate**: jitter-above-epsilon never stalls (proven; real
+  jitter is 2–4× below the mandate's hypothetical, so the reviewer's "keep the criterion, fix
+  visibility" recommendation is adopted); an SMC-clamped target degrades correctly by design; a healthy
+  fan losing ground against the ramp is impossible under measured physics (slew 750 rpm/poll vs fan
+  ~2000–3000 rpm/s); a frozen tach fires. F19's settle window came back clean on the false-PASS attack
+  (a stale echo means the register already holds the command; clamps > 50 rpm fail the window and travel
+  the counted ladder). Findings: **(1) MAJOR proven live** — the cmd-file *observe* transition drops
+  ownership on a failed `set_mode(Auto)`, re-creating the T9b MAJOR-2 shape on the channel F20 R2 did not
+  cover (supervision blind, fan parked in Manual, state renders healthy); **(2) arithmetic** — the settle
+  window ate the watchdog margin, so a *healthy* curve poll at the legal `interval_s = 14` can push the
+  ping gap to ≈15.0–15.5 s > `WatchdogSec=15` ⇒ SIGABRT crash-loop (default `interval_s = 1` is safe:
+  ≈8.2 s worst gap, ~45 % margin); (3) R4's dwell WARN latches once per excursion forever; (4) two F19
+  constants missing from the Appendix-A list (added by the orchestrator); (5) F19/F20 constants unpinned
+  by value; (6) README L1 clause overpromises ("toward its command" vs "between polls"); (7) the
+  every-poll retry and warn cadence are not test-pinned. Speculative note recorded: `doctor`'s
+  stale-binary check cannot detect "package older than repo HEAD" — the reinstall+restart discipline
+  covers it.
+- [F21 — RULED + DISPATCHED] RULING F21: (R1) mirror F20 R2 in the observe transition — keep
+  `manual_armed`, set `auto_restore_pending`, never claim an unverified release, let the every-poll retry
+  finish it; (R2) restore the watchdog margin structurally — ping twice per poll (start + end of
+  `step_once`) **and** lower `config::MAX_INTERVAL_S` 14 → 12 with the worst-case reasoning documented;
+  (R3) make the off-target dwell WARN repeat every `OFF_TARGET_WARN_POLLS` while the excursion persists,
+  documenting the movement-vs-direction trade-off (the stall criterion itself stays as ruled); (R4) pin
+  the F19/F20 constants and the two cadences by value and behaviour. Ticket
+  `orchestration/instructions/F21.md` dispatched on `fix/observe-release` (glm-5.3-flash high); a narrow
+  T9d review of F21 follows before gate (f) is declared clean.
