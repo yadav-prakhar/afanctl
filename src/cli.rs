@@ -372,14 +372,11 @@ fn format_once(report: &StepReport) -> String {
     )
 }
 
-/// `doctor`: T7 owns the checklist/`--compare` output (Appendix C). The frozen
-/// `doctor::run` signature carries no `json` parameter (Appendix A vs R5/C);
-/// see D-T6-1 — refuse loudly rather than print the wrong format.
+/// `doctor`: T7 owns the checklist/`--compare` output (Appendix C). Per ruling on
+/// D-T6-1 (ACCEPTED), `doctor::run` takes `json` and renders Appendix C as JSON
+/// (same fields) when set; the stub ignores it until T7 implements the body.
 fn run_doctor(json: bool, roundtrip: bool, compare_secs: Option<u64>) -> i32 {
-    if json {
-        return fail("doctor --json: doctor::run has no json parameter (see D-T6-1)");
-    }
-    crate::doctor::run(roundtrip, compare_secs)
+    crate::doctor::run(roundtrip, compare_secs, json)
 }
 
 /// `observe`/`curve`/`hold`: write `cmd.json` atomically (R8). The daemon owns
