@@ -9,7 +9,7 @@
 | T2 | policy | glm-5.3-flash/high | t2-policy | MERGED | 1 | 0 | 0 | aeb2b71 |
 | T3 | smc | glm-5.3-flash/high | t3-smc | MERGED | 1 | 0 | 0 | 3b41477 |
 | T4 | safety+notify | glm-5.3-flash/high | t4-safety | MERGED | 1 | 0 | 0 | 5773595 |
-| T5 | supervisor | glm-5.3-flash/high | t5-supervisor | PENDING | 0 | 0 | 0 | — |
+| T5 | supervisor | glm-5.3-flash/high | t5-supervisor | MERGED | 1 | 0 | 0 | a6bbdbd |
 | T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a) | 1 | 0 | 0 | 815d0fa |
 | T7 | doctor | deepseek-v4.1-flash | t7-doctor | PENDING | 0 | 0 | 0 | — |
 | T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | PENDING | 0 | 0 | 0 | — |
@@ -29,3 +29,7 @@
 - [fix ticket F1] T4 notify tests race on NOTIFY_SOCKET process env (abstract_socket_form_reaches_listener
   flakes ~10-30%% under parallel test threads; passes serialized). File owned by T4. Bounce to T4 model
   with failing output. Discovered during T5 verification (T5's larger suite raised flake probability).
+- [T5 verified] gates green; ~630 LOC supervisor.rs (planner-ruling parked; same class as earlier overages, $mandated feature set).
+- [F1 fixed] t4-fix1 used OnceLock<Mutex<()>> env-lock serialization (shape (a), no sig change);
+  5x consecutive green verified pre-rebase, 3x post-rebase; merged 4e5ee6e. 0 residual flake.
+- [A1 NEXT] Wave-2 complete. A1 audits after T5 per PRD §11.4 — running next.
