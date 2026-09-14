@@ -351,3 +351,34 @@ and Appendix B's `watchdog_pings` example should note the two-per-poll
 semantics. Source doc not in F21's owned file list — needs a one-line
 re-render by the orchestrator. The in-code module doc in `src/supervisor.rs`
 and all owned docs were updated.
+
+---
+
+## F24 — mode-change logging
+
+### Q-F24-1: the "arm" half of RULING F24's "whether the fan was armed/released on the way" cannot be known inside `apply_mode`
+
+RULING F24 asks the mode-change line to include "whether the fan was
+armed/released on the way (i.e. whether `set_mode(Manual|Auto)` was verified
+or failed)". For a transition **into observe** this is exact: `apply_mode`
+itself calls `set_mode(Auto)` (release), so the line reports the verified
+release, "already in AUTO", or the FAILED release (fan still Manual,
+retrying).
+
+For a transition **into curve/hold** there is no `set_mode(Manual)` call in
+`apply_mode` to report: arming is deliberately deferred to the same poll's
+control write (`act` → `write_controlled` → `enter_manual`), and calling it
+earlier would be a behaviour change (it could arm Manual with no target when
+the controller then decides `Observe` on sensor loss — exactly the
+`mbpfan.c:410` class). Arming the line's author cannot verify a write that has
+not happened yet without changing behaviour, which the ticket forbids.
+
+Implemented: `apply_mode` still logs the real transition at INFO from the
+call site, and the arm field names the honest state on the way — `fan1_manual=1
+(already armed)` for a writer→writer move, or `arming on the control write this
+poll` for a released→writer move. Failures remain loud via the existing
+`fail_write` ERROR path. Flagged per the cross-agent protocol; the unambiguous
+remainder (INFO transition + release verification + DEBUG notes) implemented.
+
+*(no blocking questions; the F24 tests pin all four transitions)*
+

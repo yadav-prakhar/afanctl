@@ -715,3 +715,62 @@ fn status_human_prints_mode_target_and_recent_errors() {
     assert!(stdout.contains("target: 1200 rpm"), "{stdout}");
     assert!(stdout.contains("recent_errors:"), "{stdout}");
 }
+
+// ---- F24: mode changes reach the daemon's journal (RULING F24, PRD R7) ----
+
+/// RULING F24 (ticket test 1): the daemon's own captured log names every real
+/// mode transition at INFO — the hardware-gate (f) evidence the old build threw
+/// away (`run()` discarded the `StepReport`). Commands go through the CLI
+/// verbs, which write `cmd.json`; the daemon re-reads and applies each poll.
+#[test]
+fn daemon_journal_names_mode_changes() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let cfg = config(&run_dir, 1);
+    let root = fixture.root.to_str().expect("utf8 root").to_owned();
+    let cfg_s = cfg.to_str().expect("utf8 cfg").to_owned();
+    let _daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    let journal = || std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+    assert!(
+        wait_until(
+            || journal().contains("daemon startup"),
+            Duration::from_secs(5)
+        ),
+        "daemon must log its startup evidence line"
+    );
+
+    for (verb, args, expect) in [
+        ("curve", vec!["curve"], "mode change: observe -> curve"),
+        (
+            "hold",
+            vec!["hold", "3000"],
+            "mode change: curve -> hold 3000",
+        ),
+        (
+            "observe",
+            vec!["observe"],
+            "mode change: hold 3000 -> observe",
+        ),
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--config", cfg_s.as_str(), "--sysfs-root", root.as_str()]);
+        let out = run(&run_dir, &argv);
+        assert!(
+            out.status.success(),
+            "{verb} verb must exit 0: {}",
+            stderr(&out)
+        );
+        assert!(
+            wait_until(|| journal().contains(expect), Duration::from_secs(5)),
+            "journal must name `{expect}` after `{verb}`; log:\n{}",
+            journal()
+        );
+    }
+
+    assert!(
+        journal().contains("released to AUTO"),
+        "the observe transition must name the release; log:\n{}",
+        journal()
+    );
+    assert_eq!(state_mode(&run_dir).as_deref(), Some("observe"));
+}
