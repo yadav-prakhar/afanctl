@@ -24,6 +24,7 @@ public item.
 
 ### N1 (note, not a deviation): transitive crates in Cargo.lock
 
+
 `Cargo.lock` contains `valuable` and `windows-sys`/`windows-link`. Verified
 these are cfg-gated optional arms of allowlisted deps (`tracing-core`'s
 `[target.'cfg(tracing_unstable)'.dependencies.valuable]`, `nu-ansi-term`'s
@@ -60,3 +61,22 @@ DESIGN.md is the binding contract per PLAN.md header).
   none trigger a bounce (mandated feature set; stop-and-report was honored).
 
 ## Final Wave 1 status: all rulings propagated; DESIGN.md amended below.
+## T3 — smc
+
+### N2 (note, not a deviation): `SysfsSmc::layout_changed` hook added
+
+The T3 card mandates a "layout-change detection hook (for doctor)" but the
+frozen Appendix A does not specify its shape. Added as an **inherent method**
+(no trait `Smc` change):
+
+- **Why an inherent method:** the `Smc` trait is frozen (MockSmc has no real
+  layout) and only a real-backend consumer (doctor, T7) needs it.
+- **Shape:** `pub fn layout_changed(&self) -> bool` — true iff discovery had
+  to fall back to a `hwmon*` subdir under the applesmc platform dir, OR a
+  `hwmon*` dir under the platform dir has grown `fan1_*` attributes
+  (conversion in flight).
+- **Affected tasks:** T7 (doctor consumes it); no other task touches it.
+
+No Appendix-A signature altered; `SmcError`, `FanMode`, `FanState`,
+`SensorReading`, the `Smc` trait, and both constructors are byte-identical
+to DESIGN.md (incl. the D1-approved `{value}` display).
