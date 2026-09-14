@@ -311,7 +311,7 @@ fn dispatch(command: Command, globals: &Globals) -> i32 {
         Command::Observe => write_cmd("observe", None),
         Command::Curve => write_cmd("curve", None),
         Command::Hold { rpm } => run_hold(rpm, globals),
-        Command::SelftestPanic => crate::safety::arm_test_panic(),
+        Command::SelftestPanic => run_selftest_panic(globals),
     }
 }
 
@@ -519,6 +519,19 @@ fn run_doctor(json: bool, roundtrip: bool, compare_secs: Option<u64>) -> i32 {
             1
         }
     }
+}
+
+/// Hidden L2 probe (R4; supervised gate §9.3c): arm the death path against the
+/// `--sysfs-root` backend, then panic deliberately — the installed hook writes
+/// `b"0"` (AUTO) before unwinding. Exits nonzero by design.
+fn run_selftest_panic(globals: &Globals) -> i32 {
+    let smc = SysfsSmc::open(&globals.sysfs_root).ok();
+    if let Some(fd) = smc.as_ref().and_then(|s| s.panic_fd()) {
+        crate::safety::install_death_path(fd);
+    }
+    // INVARIANT (fd lifetime): the panic hook runs before unwinding drops
+    // `smc`, so the pre-opened fan1_manual fd is still open when it writes AUTO.
+    crate::safety::arm_test_panic()
 }
 
 /// `hold`: clamp/reject the requested rpm against the hardware band read at

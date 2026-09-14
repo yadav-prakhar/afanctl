@@ -99,3 +99,32 @@ to DESIGN.md (incl. the D1-approved `{value}` display).
 - **Affected tasks:** T7 (owns the output), T8 (`doctor` integration), T6 PHASE (b).
 
 *(no other deviations; the frozen signatures are otherwise used as written)*
+
+---
+
+## T8 — integration + packaging
+
+### D-T8-1: `selftest-panic` never armed L2, so it could not restore AUTO (APPLIED, ratify or revert)
+
+- **Observed (old):** `src/cli.rs` dispatched `Command::SelftestPanic` straight to
+  `safety::arm_test_panic()`; `safety::install_death_path` was called only by
+  `Supervisor::run`. The hidden verb therefore panicked with no hook installed.
+  Empirically, with a fixture copy at `fan1_manual=1`,
+  `afanctl selftest-panic --sysfs-root <copy>` exited 101 and left the file at
+  `1` — L2 did **not** restore AUTO. This made the card's binding test
+  (`selftest-panic` → fixture `fan1_manual == 0`, PRD R10/§9.3c) unsatisfiable
+  and the supervised acceptance §9.3c (real hw) would fail.
+- **New (applied, minimal):** the dispatch arm is now
+  `Command::SelftestPanic => run_selftest_panic(globals)`, a 9-line function that
+  opens `SysfsSmc` on `--sysfs-root`, installs the death path when a pre-opened
+  fd exists, then calls `safety::arm_test_panic()`. No public signature changed;
+  no other behavior was touched (parse/status/once/hold/daemon unaffected).
+- **Why T8 touched a file outside its card:** the card's own integration test
+  requires the behavior, T6 (the owning task) is merged and not concurrently
+  active, and the DEVIATIONS protocol would otherwise leave a safety-critical
+  hole unaddressed. Reverting is a one-arm change. **Planner: ratify or bounce.**
+- **Interim behavior:** without a writable `--sysfs-root`, the verb still panics
+  and exits nonzero (just without a death write) — unchanged fail-loud posture.
+- **Affected tasks:** T6 (file owner), T8 (test), T9 (review), supervised gate §9.3c.
+- **Evidence:** `tests/integration.rs::selftest_panic_exits_nonzero_and_restores_auto`
+  (fixture `fan1_manual=1` → run → exits nonzero ∧ file reads `0`).
