@@ -232,3 +232,31 @@ not a doctor write path.
 Appendix C mandates "`--json` reuses the same fields" but names no schema token. Emitted
 `"schema": "afanctl.doctor.v1"` to match the repo's versioned-schema convention. One-word change
 if the planner wants a different id.
+## T8 — integration + packaging
+
+### D-T8-1 applied (not a question): see DEVIATIONS.md §T8 for the `selftest-panic`
+L2-arming fix in `src/cli.rs` (a file outside T8's card). Flagged for the
+planner's ratify-or-revert. No T8 work depends on a ruling.
+
+### Q-T8-1: PKGBUILD `url` placeholder
+
+R9 specifies the AUR name (`afanctl`) but no upstream URL. `packaging/PKGBUILD`
+carries `url="https://example.invalid/afanctl"` as a placeholder pending the Q1
+publication re-check (AUR + crates.io). One-line edit when the real URL exists;
+`makepkg` does not validate it.
+
+### Q-T8-2: polkit rule allows `status --json` (Q8 says "exact verbs")
+
+R8's plugin story makes `status --json` the omafan render feed, but Q8 says an
+"allowlist of exact verbs" and `hold` only an integer rpm. The shipped rule
+(`packaging/49-afanctl.rules`) therefore allows exactly `status`,
+`status --json`, `observe`, `curve`, and `hold <integer>`; it rejects every
+other flag and all globals (`--config`, `--sysfs-root`). pkexec's
+`command_line` detail is space-joined and the man page warns against using it
+for security checks, and `argv1` cannot constrain the rpm integer — so the rule
+re-checks `program` (realpath) and the argv shape, while the CLI independently
+parses/clamps the rpm. If Q8 is meant literally (no flags at all), drop the
+`--json` arm (one line). The rule is data: `makepkg` installs it; it is not
+executed by the test gates.
+
+
