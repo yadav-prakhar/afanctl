@@ -432,3 +432,13 @@ flagged in HANDOFF.md §5 rather than buried here.
 `hold 3000`, and the `systemctl enable` reboot test remain — user-gated, printed in PLAN.md Appendix P5
 and summarised in `HANDOFF.md` §5.** Store-and-deploy honesty: `master` is the finished tree; the
 installed package at handoff is the 22:55 build.
+- [F24 — DEFECT FOUND IN THE GATE PHASE, after the review gate closed] PRD §6.R7 requires mode changes to
+  be logged at INFO; `apply_mode` records them only as `StepReport` notes ("cmd applied: …"), and `run()`
+  **discards the report**, so no mode change ever reaches the journal. The user's one-hour curve soak
+  (gate f) therefore left **three journal lines and no record of control being taken** — the evidence for
+  the gate was destroyed by the daemon itself. RULING F24: log real mode transitions at INFO directly
+  from `apply_mode` (naming previous → new mode, the hold rpm, and whether the fan was armed/released
+  verified), and log the report's remaining notes at DEBUG from `run()` (per-poll detail per R7). No
+  behaviour, schema or signature change. Ticket `orchestration/instructions/F24.md` dispatched. Note this
+  finding is exactly the class the plan's sequencing guard predicts: the review gate can only review code
+  that exists, and the hardware gate exercises paths the reviewers reasoned about but could not observe.
