@@ -289,7 +289,15 @@ impl Supervisor {
         let _ = crate::notify::sd_status(&format!("mode={}", mode_name(&self.mode)));
         let _ = crate::notify::sd_ready();
         loop {
-            self.step_once();
+            let report = self.step_once();
+            // RULING F24 (R7): the mode-change line is INFO from `apply_mode`;
+            // the report's *remaining* notes (tracking re-asserts, watchdog
+            // notes, the `cmd applied` echoes) are per-poll detail — R7's
+            // debug level. One line per poll at most, and only when there is
+            // something to say, so a healthy poll stays silent.
+            if !report.notes.is_empty() {
+                tracing::debug!("{}", report.notes.join("; "));
+            }
             std::thread::sleep(self.interval);
         }
     }
@@ -473,6 +481,12 @@ impl Supervisor {
 
     /// Apply a validated command: no-op if identical to the current mode;
     /// enter control (manual) or leave it (AUTO) through the verify path.
+    ///
+    /// RULING F24 (R7): a *real* transition logs at INFO from here — `run()`
+    /// discards the `StepReport`, so the report note alone never reached the
+    /// journal (a curve soak left no evidence control was ever taken). The
+    /// unchanged-mode early-return below stays: a persistent cmd file must
+    /// not re-log (freshness gate).
     fn apply_mode(&mut self, requested: RunMode, notes: &mut Vec<String>) {
         // RULING F20 (R3): one "no L2 → observe" invariant, both channels —
         // the startup guard degraded the mode, so a cmd file must not re-arm
@@ -500,9 +514,10 @@ impl Supervisor {
         if requested == self.mode {
             return; // INVARIANT: never re-issue an idempotent mode change.
         }
+        let from = self.mode.clone();
         // Leave AUTO behind only when entering a writing control mode.
         if requested == RunMode::Observe && self.mode != RunMode::Observe {
-            if self.manual_armed {
+            let fan_state = if self.manual_armed {
                 match self.smc.set_mode(FanMode::Auto) {
                     Ok(_) => {
                         self.manual_armed = false;
@@ -511,6 +526,7 @@ impl Supervisor {
                         self.auto_restore_attempts = 0;
                         self.auto_retry_log_polls = 0;
                         notes.push("cmd applied: observe (fan1_manual=0)".into());
+                        "fan released to AUTO (fan1_manual=0, verified)".to_owned()
                     }
                     Err(e) => {
                         // SAFETY-INVARIANT (RULING F21 R1, the cmd-file
@@ -526,15 +542,28 @@ impl Supervisor {
                         self.auto_restore_attempts = 1;
                         self.auto_retry_log_polls = AUTO_RETRY_LOG_POLLS;
                         self.fail_write(format!("cmd observe: set AUTO error: {e}"), notes);
+                        format!("AUTO release FAILED ({e}); fan still Manual, retrying")
                     }
                 }
             } else {
                 notes.push("cmd applied: observe".into());
-            }
+                "fan already in AUTO".to_owned()
+            };
+            tracing::info!("{}", mode_change_message(&from, &requested, &fan_state));
             self.mode = requested;
             return;
         }
         notes.push(format!("cmd applied: {}", mode_name(&requested)));
+        // Entering a writing control mode: `set_mode(Manual)` happens on this
+        // poll's control write (`act` → `write_controlled`), after this line,
+        // so name the arm state on the way rather than claim a verification
+        // that has not happened yet. A previous writer mode keeps the fan.
+        let fan_state = if self.manual_armed {
+            "fan1_manual=1 (already armed)".to_owned()
+        } else {
+            "arming on the control write this poll".to_owned()
+        };
+        tracing::info!("{}", mode_change_message(&from, &requested, &fan_state));
         self.mode = requested;
     }
 
@@ -949,6 +978,18 @@ fn mode_name(mode: &RunMode) -> String {
     }
 }
 
+/// RULING F24 (R7): one-line INFO message for a real mode transition.
+/// `mode_name(Hold)` already carries the rpm; `fan_state` names the
+/// `fan1_manual` outcome on the way (release verified/failed, arm already
+/// held, or the pending arm the control write performs).
+fn mode_change_message(from: &RunMode, to: &RunMode, fan_state: &str) -> String {
+    format!(
+        "mode change: {} -> {} ({fan_state})",
+        mode_name(from),
+        mode_name(to)
+    )
+}
+
 /// Schema-token mode name for `state.json` (Appendix B `mode` values).
 fn mode_token(mode: &RunMode) -> String {
     match mode {
@@ -1043,6 +1084,39 @@ mod tests {
             label: "Core 0".to_string(),
             milli_c: None,
         }
+    }
+
+    /// RULING F24 test seam: capture this thread's `tracing` output so a unit
+    /// test can assert on emitted lines. Thread-local (`with_default`), so
+    /// parallel tests do not cross-talk; DEBUG max level includes INFO.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer({
+                let buf = buf.clone();
+                move || buf.clone()
+            })
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().expect("log buffer")).into_owned();
+        (value, text)
     }
 
     static TMP_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -1251,6 +1325,58 @@ mod tests {
         let fan = sm.fan();
         assert_eq!(fan.mode, FanMode::Auto);
         assert!(!sup.manual_armed);
+    }
+
+    /// Card check (RULING F24 test 2): a real mode transition emits exactly one
+    /// INFO `mode change:` line naming previous → new (hold carries the rpm);
+    /// an unchanged command — a re-read or a byte-identical re-issue — emits
+    /// nothing, so the freshness gate cannot spam the journal.
+    #[test]
+    fn mode_change_logs_info_on_a_real_transition_only() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let (_, logs) = capture_logs(|| sup.step_once());
+        assert!(
+            logs.contains("mode change: observe -> curve"),
+            "a real transition must log at INFO: {logs}"
+        );
+
+        // No new command this poll: the freshness gate returns before
+        // `apply_mode`, so no mode-change line is emitted.
+        let (_, logs) = capture_logs(|| sup.step_once());
+        assert!(
+            !logs.contains("mode change:"),
+            "an unchanged poll must not re-log the mode: {logs}"
+        );
+
+        // A byte-identical re-issue is also ignored (freshness gate).
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let (_, logs) = capture_logs(|| sup.step_once());
+        assert!(
+            !logs.contains("mode change:"),
+            "a byte-identical cmd must not re-log: {logs}"
+        );
+
+        // A real transition into hold names the rpm.
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let (_, logs) = capture_logs(|| sup.step_once());
+        assert!(
+            logs.contains("mode change: curve -> hold 3000"),
+            "hold must name its rpm: {logs}"
+        );
+        assert!(logs.contains("(fan1_manual=1"), "already armed: {logs}");
+
+        // A real transition back to observe names the release.
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"observe"}"#);
+        let (_, logs) = capture_logs(|| sup.step_once());
+        assert!(
+            logs.contains("mode change: hold 3000 -> observe"),
+            "release must name hold 3000 -> observe: {logs}"
+        );
+        assert!(logs.contains("released to AUTO"), "release named: {logs}");
     }
 
     /// Card check: an invalid cmd is ignored + logged, previous mode kept.
