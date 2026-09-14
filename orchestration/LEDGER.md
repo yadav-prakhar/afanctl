@@ -105,6 +105,18 @@
   verified write, loud log; failure ⇒ observe + monitor_only) → sd_ready → loop; plus one startup
   info! line (journal currently carries only systemd's lines, so §9.3d has no app-side evidence).
   Ticket F14 dispatched (glm-5.3-flash high). P5 (e) and (f) marked BLOCKED until it lands.
+- [F14 — MERGED] branch `fix/startup-reconcile` (9c5f400) merged to main; gates green on merged tree
+  (126 tests, fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator, not self-report:
+  `run()` order is arm L2 → `reconcile_stale_state()` → evidence line → sd_ready → loop; reconcile =
+  Manual ⇒ verified `set_mode(Auto)` + loud warn/info + note_recent, failure ⇒ observe + monitor_only,
+  Auto ⇒ zero writes. Tests present: 4 unit (single verified write / no write on healthy path /
+  read-failure degrade / restore-failure degrade) + 2 integration (observe reconciles stale manual;
+  curve reconciles then takes control). Package rebuilt (20:01) for reinstall.
+- [RULING N-F14-1 — ACCEPTED (partial)] agent stopped instead of altering frozen `RuntimePaths` to carry
+  the config-source path for the startup line; shipped line names mode, L2 armed, notify path, state file,
+  hw band. Accepted: config provenance stays visible via `status --json`, and the field's value in the
+  journal is marginal. The proposed `RuntimePaths{+config_source}` change is parked for the F15 bundle
+  (same file, cli.rs) if the user wants F15 — no separate signature change now.
 - [MINOR F15 (deferred, user's call)] non-root `afanctl status` prints the smc discovery WARN
   "cannot pre-open fan1_manual O_WRONLY; L2 death path unavailable (os error 13)" before its human
   output. Honest but misleading on a read-only path the plugin/polkit rule is designed to allow;
