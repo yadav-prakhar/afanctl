@@ -293,3 +293,26 @@ T9fixA's defect list asks for a README once-row update (F1 doc half), but its
 RULES assign README to Ticket B. Resolved per the cross-agent protocol: the
 code + tests implement the restore; the README wording change is recorded in
 DEVIATIONS.md `## FX-A` (N-FX-A-1) for Ticket B. No answer needed to proceed.
+
+## F16 — write-verification semantics (RULING F16)
+
+### N-F16-1 (resolved-in-implementation): R3 stall ladder interpretation
+
+R3 reads "…log an error, count a failure ⇒ AUTO + monitor-only", while the
+general fallback ladder is `WRITE_FAIL_FALLBACK = 3`. The ticket's required
+test 3 pins **a single detected stall ⇒ AUTO + monitor-only after
+`STALL_POLLS`**, so the stall detector degrades directly (loud error +
+`degrade_to_auto`) instead of riding the 3-strike ladder. Recorded here in
+case the orchestrator intended the ladder; test 3 is authoritative in the
+meantime.
+
+### N-F16-2 (resolved-in-implementation): echo-not-taken on the static fixture
+
+With echo verification (R1), a static fixture's `fan1_output` file *holds* the
+written value, so real "write not taken" can only be fault-injected via
+`MockSmc::set_write_stuck` (test 4). The old
+`fixture_write_not_taking_fails_verify_after_k_retries` test encoded the F16
+defect itself and was rewritten as
+`fixture_write_verified_by_register_echo`. The lag/Auto-mirror modeling (R5)
+lives in `MockSmc` (`set_tach_lag` / `set_tach_frozen`); the static file tree
+is inert by nature and needs no dynamic rpm modeling for the required tests.

@@ -3,10 +3,15 @@
 //! read-back-verify invariant.
 //!
 //! Invariants: every state-changing write (`fan1_output`, `fan1_manual`) is
-//! followed by a read-back within `VERIFY_TOLERANCE_RPM` (mode: exact match),
-//! retried up to K=3 attempts; logical state commits only on verified
-//! read-back; all rpm writes clamped to [`fan1_min`, `fan1_max`] read at
-//! discovery; sensor readings < 0 °C or > 120 °C rejected as failed reads.
+//! followed by a read-back within tolerance (mode: exact match), retried up
+//! to K=3 attempts; logical state commits only on verified read-back; all
+//! rpm writes clamped to [`fan1_min`, `fan1_max`] read at discovery; sensor
+//! readings < 0 °C or > 120 °C rejected as failed reads.
+//!
+//! RULING F16 (R1): `fan1_output` writes are verified against the
+//! **`fan1_output` echo** within `WRITE_ECHO_TOLERANCE_RPM`. `fan1_input` is
+//! the tachometer and is never a write-verification source — a fan still
+//! spinning toward the target is not a failed write.
 
 /// Fan control mode as exposed by applesmc (`fan1_manual`: 0 = auto, 1 = manual).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,13 +77,14 @@ pub trait Smc: Send {
     fn panic_fd(&self) -> Option<i32>;
 }
 
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::policy::VERIFY_TOLERANCE_RPM;
+use crate::policy::WRITE_ECHO_TOLERANCE_RPM;
 
 // ---- sysfs path pieces (PRD §2.1): the only path strings in the crate ----
 const PLATFORM: &str = "devices/platform";
@@ -323,11 +329,12 @@ impl Smc for SysfsSmc {
     }
 
     /// INVARIANT: write + read-back-verify within K=3 retries; commit logical
-    /// state only on verified read-back (R1).
+    /// state only on verified read-back (R1). RULING F16: verification is the
+    /// `fan1_output` echo within `WRITE_ECHO_TOLERANCE_RPM` — the tachometer
+    /// (`fan1_input`) lags every ramp and must never gate a write.
     fn write_speed(&mut self, rpm: u32) -> Result<u32, SmcError> {
         let target = rpm.clamp(self.hw_min, self.hw_max);
         let out = self.fan_dir.join(FAN_OUTPUT);
-        let input = self.fan_dir.join(FAN_INPUT);
         let mut mismatch: Option<u32> = None;
         for attempt in 1..=VERIFY_ATTEMPTS {
             // A failed write syscall surfaces immediately (R4 fail-toward-AUTO);
@@ -336,9 +343,9 @@ impl Smc for SysfsSmc {
                 path: out.clone(),
                 source,
             })?;
-            let read_back = read_u32(&input)?;
-            if read_back.abs_diff(target) <= VERIFY_TOLERANCE_RPM {
-                tracing::debug!(rpm = target, "fan1_output write verified");
+            let read_back = read_u32(&out)?;
+            if read_back.abs_diff(target) <= WRITE_ECHO_TOLERANCE_RPM {
+                tracing::debug!(rpm = target, "fan1_output write verified (register echo)");
                 return Ok(target);
             }
             tracing::warn!(
@@ -388,14 +395,23 @@ impl Smc for SysfsSmc {
 }
 
 /// Scriptable mock backend: injectable faults, drift, latency. Test-only
-/// workhorse for R10 (round-trip, drift, failed reads, mode flip).
+/// workhorse for R10 (round-trip, drift, failed reads, mode flip). RULING F16
+/// (R5): gains a *tach-lag mode* modeling real physics — the `fan1_output`
+/// register takes a write instantly (echo unverifiable otherwise) while the
+/// actual rpm slews toward the commanded target at a bounded rate, and in
+/// `Auto` the mock mirrors its own value into `fan1_output` (real applesmc
+/// does), so an echo check while not in manual is correctly "not taken".
 pub struct MockSmc {
     hw_min: u32,
     hw_max: u32,
     sensors: Vec<SensorReading>,
-    rpm: u32,
+    /// Tachometer value (`fan1_input`): instant mode it follows writes; lag
+    /// mode it slews (Cell: `read_fan` advances the slew from `&self`).
+    rpm: Cell<u32>,
+    /// `fan1_output` register echo; only independent from `rpm` in lag mode.
+    out_reg: Cell<u32>,
     mode: FanMode,
-    /// When set, every `write_speed` read-back returns this rpm (write "doesn't take").
+    /// When set, every `write_speed` echo read-back returns this rpm (write "doesn't take").
     write_stuck_rpm: Option<u32>,
     /// When set, every `set_mode` read-back returns this mode (mode flip).
     mode_read_back: Option<FanMode>,
@@ -403,6 +419,11 @@ pub struct MockSmc {
     fan_read_fault: Option<io::ErrorKind>,
     /// Injected per-call latency (supervisor timeout tests).
     latency: Option<Duration>,
+    /// Tach-lag mode: `Some(rate)` = tach slews toward the register at ≤ rate
+    /// rpm per read; `None` = the historical instant-echo idealization.
+    lag_rate: Option<u32>,
+    /// Lag-mode switch: freeze the tach entirely (stall-detector test).
+    tach_frozen: bool,
     /// Total write attempts (write_speed + set_mode) — proves the K=3 retry count.
     write_attempts: u32,
 }
@@ -414,12 +435,15 @@ impl MockSmc {
             hw_min,
             hw_max,
             sensors: Vec::new(),
-            rpm: hw_min,
+            rpm: Cell::new(hw_min),
+            out_reg: Cell::new(hw_min),
             mode: FanMode::Auto,
             write_stuck_rpm: None,
             mode_read_back: None,
             fan_read_fault: None,
             latency: None,
+            lag_rate: None,
+            tach_frozen: false,
             write_attempts: 0,
         }
     }
@@ -431,12 +455,18 @@ impl MockSmc {
     }
 
     /// Set the fan's current reported state (drift injection between polls).
+    /// INVARIANT (lag mode): the register mirrors the tach — an SMC-owned fan
+    /// shows its own target in `fan1_output`, so a later echo check while
+    /// still in Auto is a genuine "not taken".
     pub fn set_fan_state(&mut self, rpm: u32, mode: FanMode) {
-        self.rpm = rpm;
+        self.rpm.set(rpm);
         self.mode = mode;
+        if self.lag_rate.is_some() {
+            self.out_reg.set(rpm);
+        }
     }
 
-    /// Make every `write_speed` read-back return `read_back` (None = honest).
+    /// Make every `write_speed` echo read-back return `read_back` (None = honest).
     pub fn set_write_stuck(&mut self, read_back: Option<u32>) {
         self.write_stuck_rpm = read_back;
     }
@@ -456,6 +486,18 @@ impl MockSmc {
         self.latency = latency;
     }
 
+    /// RULING F16 (R5): enable tach-lag mode at the given bounded slew rate
+    /// (rpm per read; 1 Hz polls ⇒ rpm/s). Tach starts from the current value.
+    pub fn set_tach_lag(&mut self, rpm_per_poll: u32) {
+        self.lag_rate = Some(rpm_per_poll);
+        self.out_reg.set(self.rpm.get());
+    }
+
+    /// Lag-mode switch: freeze the tach (never moves — stall detector test).
+    pub fn set_tach_frozen(&mut self, frozen: bool) {
+        self.tach_frozen = frozen;
+    }
+
     /// Total write attempts so far (proves the K=3 retry bound).
     pub fn write_attempts(&self) -> u32 {
         self.write_attempts
@@ -464,6 +506,17 @@ impl MockSmc {
     fn nap(&self) {
         if let Some(delay) = self.latency {
             std::thread::sleep(delay);
+        }
+    }
+
+    /// Bounded-rate tach physics (RULING F16 R5): move at most `rate` rpm
+    /// toward the register target, never past it.
+    fn tach_slew(&self, from: u32, rate: u32) -> u32 {
+        let target = self.out_reg.get();
+        if target >= from {
+            (from + rate).min(target)
+        } else {
+            from.saturating_sub(rate).max(target)
         }
     }
 }
@@ -492,8 +545,18 @@ impl Smc for MockSmc {
                 source: io::Error::from(kind),
             });
         }
+        // RULING F16 (R5) tach physics: in lag mode the tachometer slews
+        // toward the register target (a fan still decelerating); in Auto the
+        // SMC mirrors its own value into `fan1_output`.
+        if let Some(rate) = self.lag_rate {
+            if self.mode == FanMode::Manual && !self.tach_frozen {
+                self.rpm.set(self.tach_slew(self.rpm.get(), rate));
+            } else if self.mode == FanMode::Auto {
+                self.out_reg.set(self.rpm.get());
+            }
+        }
         Ok(FanState {
-            rpm: self.rpm,
+            rpm: self.rpm.get(),
             mode: self.mode,
         })
     }
@@ -505,17 +568,32 @@ impl Smc for MockSmc {
         self.hw_max
     }
 
-    /// Same K=3 read-back-verify invariant as the real backend.
+    /// Same K=3 echo-verify invariant as the real backend (RULING F16 R1:
+    /// the echo is `fan1_output`, tolerance `WRITE_ECHO_TOLERANCE_RPM`).
     fn write_speed(&mut self, rpm: u32) -> Result<u32, SmcError> {
         let target = rpm.clamp(self.hw_min, self.hw_max);
         let mut mismatch: Option<u32> = None;
         for _attempt in 1..=VERIFY_ATTEMPTS {
             self.write_attempts += 1;
             self.nap();
-            let read_back = self.write_stuck_rpm.unwrap_or(target);
-            if read_back.abs_diff(target) <= VERIFY_TOLERANCE_RPM {
-                // INVARIANT: logical state commits only on verified read-back.
-                self.rpm = read_back;
+            let read_back = match (self.write_stuck_rpm, self.lag_rate) {
+                (Some(stuck), _) => stuck,
+                // Lag mode, honest: the register takes the value when we own
+                // the fan; an SMC-owned fan keeps mirroring its own value
+                // (echo "not taken", matching real hardware).
+                (None, Some(_)) if self.mode == FanMode::Manual => {
+                    self.out_reg.set(target);
+                    self.out_reg.get()
+                }
+                (None, Some(_)) => self.out_reg.get(),
+                (None, None) => target,
+            };
+            if read_back.abs_diff(target) <= WRITE_ECHO_TOLERANCE_RPM {
+                // INVARIANT: logical state commits only on verified read-back
+                // (instant mode only; lag mode tach follows its own physics).
+                if self.lag_rate.is_none() {
+                    self.rpm.set(read_back);
+                }
                 return Ok(target);
             }
             mismatch = Some(read_back);
@@ -536,6 +614,10 @@ impl Smc for MockSmc {
             let got = self.mode_read_back.unwrap_or(mode);
             if got == mode {
                 self.mode = got;
+                if self.lag_rate.is_some() && mode == FanMode::Auto {
+                    // Auto restore: the SMC mirrors its own value into the register.
+                    self.out_reg.set(self.rpm.get());
+                }
                 return Ok(mode);
             }
             mismatch = Some(u32::from(got == FanMode::Manual));
@@ -671,25 +753,27 @@ mod tests {
     #[test]
     fn mock_verify_accepts_within_tolerance_readback() {
         let mut smc = MockSmc::new(1200, 7200);
-        smc.set_write_stuck(Some(1300)); // actual settles 100 rpm above target
+        // RULING F16: the echo band is WRITE_ECHO_TOLERANCE_RPM=50 — the
+        // register settling 50 rpm above the target still verifies.
+        smc.set_write_stuck(Some(1250));
         assert_eq!(smc.write_speed(1200).expect("within tolerance"), 1200);
-        assert_eq!(smc.read_fan().expect("fan").rpm, 1300);
+        assert_eq!(smc.read_fan().expect("fan").rpm, 1250);
         assert_eq!(smc.write_attempts(), 1);
     }
 
     #[test]
-    fn fixture_write_not_taking_fails_verify_after_k_retries() {
-        // Static fixture: fan1_input never follows fan1_output, so a write
-        // "doesn't take" exactly like stuck hardware would.
+    fn fixture_write_verified_by_register_echo() {
+        // RULING F16 (R1): a static fixture's `fan1_output` file holds the
+        // written value, so the write IS taken and verify passes by echo —
+        // the previously failing claim (verified via the tachometer
+        // `fan1_input`) encoded the F16 defect. The echo-not-taken class is
+        // fault-injected via MockSmc (see the stuck tests above).
         let tmp = TempFixture::copy_of("");
         let mut smc = SysfsSmc::open(&tmp.root).expect("open");
-        let err = smc.write_speed(3000).unwrap_err();
-        assert_verify_failed(err, 3000, 1200);
-        // The write syscall itself happened (last attempt persisted)…
+        assert_eq!(smc.write_speed(3000).expect("echo verify"), 3000);
         let out = fs::read_to_string(tmp.root.join("devices/platform/applesmc.768/fan1_output"))
             .expect("read output");
-        assert_eq!(out.trim(), "3000");
-        // …but verify never saw it on fan1_input → error after K=3 attempts.
+        assert_eq!(out.trim(), "3000", "the register echo carries the write");
     }
 
     #[test]

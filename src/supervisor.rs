@@ -36,7 +36,9 @@ pub struct StepReport {
 }
 
 use crate::config::ResolvedConfig;
-use crate::policy::{Controller, Decision, MilliC, VERIFY_TOLERANCE_RPM, WRITE_FAIL_FALLBACK};
+use crate::policy::{
+    Controller, Decision, MilliC, STALL_POLLS, VERIFY_TOLERANCE_RPM, WRITE_FAIL_FALLBACK,
+};
 use crate::smc::{FanMode, Smc};
 
 /// Errors surfaced by the supervisor (per-module thiserror enum, §7).
@@ -70,6 +72,14 @@ pub struct Supervisor {
     last_actual: Option<u32>,
     /// Consecutive failed writes/re-asserts → `WRITE_FAIL_FALLBACK`.
     write_failures: u32,
+    /// RULING F16 (R3) stall window: command this window is keyed on.
+    stall_cmd: Option<u32>,
+    /// Polls since the window began (or since deviation last improved).
+    stall_polls: u32,
+    /// Deviation when the window began.
+    stall_base_dev: u32,
+    /// Smallest deviation seen in the window (convergence evidence).
+    stall_min_dev: u32,
     cfg_max_rpm: u32,
     hw_min: u32,
     hw_max: u32,
@@ -138,6 +148,10 @@ impl Supervisor {
             last_written: None,
             last_actual: None,
             write_failures: 0,
+            stall_cmd: None,
+            stall_polls: 0,
+            stall_base_dev: 0,
+            stall_min_dev: 0,
             hw_min: hw.0,
             hw_max: hw.1,
             last_cmd: None,
@@ -172,8 +186,8 @@ impl Supervisor {
         // 3. act via smc (verified write path; every decision produces
         // exactly one action — including "write nothing", R2).
         let applied = self.act(&decision, &mut notes);
-        // 4. L1 per-poll verify/re-assert (R4).
-        let l1_ok = self.l1_poll(&mut notes);
+        // 4. L1 per-poll verify/re-assert (RULING F16 R2/R3).
+        let l1_ok = self.l1_poll(applied, &mut notes);
         // INVARIANT: verified reports the failure verdict this poll; a
         // monitor-only degraded supervisor reports false even when idle.
         let verified = !self.monitor_only && l1_ok;
@@ -282,6 +296,8 @@ impl Supervisor {
         self.manual_armed = false;
         self.last_written = None;
         self.write_failures = 0;
+        self.stall_cmd = None;
+        self.stall_polls = 0;
     }
 
     /// One startup evidence line (RULING F14 observability): effective mode,
@@ -508,10 +524,19 @@ impl Supervisor {
 
     // ---- step 4: L1 (R4) ----
 
-    /// Re-read `fan1_manual` + `fan1_input`; re-assert mode/rpm drift. A
-    /// failed poll bumps the counter; `WRITE_FAIL_FALLBACK` consecutive
-    /// failures → AUTO + monitor-only, logged loudly.
-    fn l1_poll(&mut self, notes: &mut Vec<String>) -> bool {
+    /// RULING F16 (R2/R3) — L1 is three independent checks:
+    /// - **Mode drift**: `fan1_manual` reads `Auto` while we own the fan ⇒
+    ///   re-assert `set_mode(Manual)`; its failures are counted.
+    /// - **Tracking**: actual rpm more than `VERIFY_TOLERANCE_RPM` from the
+    ///   last written value ⇒ idempotent re-assert of the write, *never
+    ///   counted* — a fan still decelerating is not a broken fan.
+    /// - **Stall detector**: command unchanged for `STALL_POLLS` consecutive
+    ///   polls with the deviation still beyond tolerance and never decreased
+    ///   ⇒ unresponsive actuator ⇒ loud error, AUTO + monitor-only.
+    ///
+    /// Only mode-drift failures, write-syscall errors and echo failures
+    /// increment `write_failures` (`WRITE_FAIL_FALLBACK` → fallback).
+    fn l1_poll(&mut self, applied: Option<u32>, notes: &mut Vec<String>) -> bool {
         let fan = match self.smc.read_fan() {
             Ok(fan) => {
                 self.last_actual = Some(fan.rpm);
@@ -526,6 +551,8 @@ impl Supervisor {
             }
         };
         if !self.manual_armed {
+            self.stall_cmd = None;
+            self.stall_polls = 0;
             return true; // not ours to verify
         }
         let mut failed = false;
@@ -536,21 +563,55 @@ impl Supervisor {
             }
         }
         if let Some(written) = self.last_written {
-            if fan.rpm.abs_diff(written) > VERIFY_TOLERANCE_RPM {
+            let dev = fan.rpm.abs_diff(written);
+            // Tracking (R2): physical deviation is an idempotent re-assert;
+            // skipped when this poll's act step already wrote the same value.
+            if !self.monitor_only && dev > VERIFY_TOLERANCE_RPM && applied.is_none() {
                 notes.push(format!(
-                    "L1: driften {drift} rpm from last written {written}; re-asserting",
-                    drift = fan.rpm.abs_diff(written)
+                    "L1: tracking {dev} rpm from written {written}; re-asserting (not a failure)"
                 ));
                 match self.smc.write_speed(written) {
                     // INVARIANT: logical state only from verified read-back.
                     Ok(verified) => {
                         self.last_written = Some(verified);
-                        notes.push(format!("L1: drift re-asserted at {verified} rpm"));
+                        notes.push(format!("L1: re-asserted at {verified} rpm"));
                     }
                     Err(e) => {
                         failed = true;
                         self.fail_write(format!("L1 re-assert {written}: {e}"), notes);
                     }
+                }
+            }
+            // Stall detector (R3).
+            if self.stall_cmd != Some(written) {
+                self.stall_cmd = Some(written);
+                self.stall_polls = 1;
+                self.stall_base_dev = dev;
+                self.stall_min_dev = dev;
+            } else {
+                self.stall_polls = self.stall_polls.saturating_add(1);
+                self.stall_min_dev = self.stall_min_dev.min(dev);
+                // INVARIANT: convergence restarts the window — a fan that is
+                // still approaching the command is never a stalled one.
+                if dev < self.stall_base_dev {
+                    self.stall_base_dev = dev;
+                    self.stall_min_dev = dev;
+                    self.stall_polls = 1;
+                }
+                if self.stall_polls >= STALL_POLLS
+                    && dev > VERIFY_TOLERANCE_RPM
+                    && self.stall_min_dev >= self.stall_base_dev
+                {
+                    let msg = format!(
+                        "stall detector: command {written} unchanged for {STALL_POLLS} polls, fan stuck {dev} rpm away and never closer; actuator unresponsive"
+                    );
+                    tracing::error!("{msg}");
+                    self.note_recent(msg.clone());
+                    notes.push(msg);
+                    self.stall_cmd = None;
+                    self.stall_polls = 0;
+                    self.degrade_to_auto(notes);
+                    return false;
                 }
             }
         }
@@ -598,6 +659,8 @@ impl Supervisor {
         self.manual_armed = false;
         self.last_written = None;
         self.write_failures = 0;
+        self.stall_cmd = None;
+        self.stall_polls = 0;
         tracing::error!(
             "L1 fallback: {} failed writes → AUTO restored, degrading to monitor-only",
             WRITE_FAIL_FALLBACK
@@ -759,6 +822,14 @@ mod tests {
         }
     }
 
+    /// Cold sensor: curve target pins at `min_rpm` (below `low_c`).
+    fn cool() -> SensorReading {
+        SensorReading {
+            label: "Core 0".to_string(),
+            milli_c: Some(MilliC(45_000)),
+        }
+    }
+
     fn none_label() -> SensorReading {
         SensorReading {
             label: "Core 0".to_string(),
@@ -839,6 +910,12 @@ mod tests {
         }
         fn set_mode_read_back(&self, mode: Option<FanMode>) {
             self.smc().set_mode_read_back(mode);
+        }
+        fn set_tach_lag(&self, rpm_per_poll: u32) {
+            self.smc().set_tach_lag(rpm_per_poll);
+        }
+        fn set_tach_frozen(&self, frozen: bool) {
+            self.smc().set_tach_frozen(frozen);
         }
         fn write_attempts(&self) -> u32 {
             self.smc().write_attempts()
@@ -981,10 +1058,11 @@ mod tests {
         assert!(sup.manual_armed, "control state untouched");
     }
 
-    /// Card check: L1 detects drift beyond tolerance and re-asserts (hold —
-    /// the curve slew moves every poll, so the fixed hold target isolates L1).
+    /// Card check (RULING F16 test 6): a pure tracking deviation beyond the
+    /// tolerance band is an idempotent re-assert — never counted, never a
+    /// fallback (the old `l1_reasserts_on_drift` semantics, made explicit).
     #[test]
-    fn l1_reasserts_on_drift() {
+    fn l1_tracking_deviation_reasserts_without_counting() {
         let dir = TempDir::new();
         dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
         let sm = mock_with(vec![hot()]);
@@ -993,16 +1071,30 @@ mod tests {
                          // Firmware/other process moves the fan away from the written value.
         sm.set_fan_state(2700, FanMode::Manual); // 300 rpm drift > 150
         let rep = sup.step_once();
-        assert!(rep.notes.iter().any(|n| n.contains("re-asserted at 3000")));
+        assert!(
+            rep.notes.iter().any(|n| n.contains("re-asserted at 3000")),
+            "tracking deviation must re-assert, notes: {:?}",
+            rep.notes
+        );
         assert_eq!(
             rep.applied_rpm, None,
             "decision re-write skipped (same target)"
         );
+        assert!(
+            rep.notes.iter().any(|n| n.contains("not a failure")),
+            "the deviation is explicitly labeled tracking, notes: {:?}",
+            rep.notes
+        );
+        // INVARIANT (RULING F16 R2): a decelerating fan is not a failed write.
+        assert_eq!(sup.write_failures, 0);
+        assert!(!sup.monitor_only);
         let fan = sm.fan();
         assert_eq!(fan.rpm, 3000, "drift re-asserted to last written");
     }
 
-    /// Card check: drift within tolerance does NOT re-assert.
+    /// Card check (RULING F16 test 6): deviation within the tolerance band
+    /// does NOT re-assert and does not touch the failure counter — the
+    /// steady-state tracking band, distinct from the counted failure class.
     #[test]
     fn l1_tolerance_band_suppresses_reassert() {
         let dir = TempDir::new();
@@ -1017,6 +1109,9 @@ mod tests {
             "within-tolerance drift must not re-assert, notes: {:?}",
             rep.notes
         );
+        assert!(rep.verified, "the poll is healthy");
+        assert_eq!(sup.write_failures, 0, "nothing counted");
+        assert!(!sup.monitor_only, "no fallback from a tracking band");
     }
 
     /// Card check: three consecutive failed writes → AUTO + monitor-only;
@@ -1177,7 +1272,6 @@ mod tests {
     }
 
     // ---- F14 startup reconcile (RULING F14, ticket tests 1a–1d) ----
-
     /// 1a: mock reports Manual at startup ⇒ exactly one set_mode(Auto),
     /// no other write.
     #[test]
@@ -1241,6 +1335,140 @@ mod tests {
                 .iter()
                 .any(|e| e.msg.contains("restoring AUTO failed")),
             "loud error recorded: {:?}",
+            sup.recent_errors
+        );
+    }
+
+    // ---- F16 write-verification semantics (RULING F16, ticket tests 1–5) ----
+
+    /// RULING F16 test 1: the hardware event, reproduced on fixtures — tach
+    /// 6170, curve target 1200, tach-lag mode at 1500 rpm/poll. The ramp
+    /// re-asserts the write each poll (tracking, uncounded) and reaches 1200
+    /// with zero `write_failures` and no monitor-only fallback.
+    #[test]
+    fn f16_hardware_event_converges_without_fallback() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![cool()]);
+        sm.set_fan_state(6170, FanMode::Auto); // SMC-owned fast-spinning fan
+        sm.set_tach_lag(1500); // real deceleration physics
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        for _ in 0..10 {
+            let rep = sup.step_once();
+            assert!(rep.verified, "poll must be healthy during the ramp");
+        }
+        // The fan converged after ~4 polls of bounded-rate slewing.
+        let fan = sm.fan();
+        assert!(
+            fan.rpm.abs_diff(1200) <= VERIFY_TOLERANCE_RPM,
+            "tach must converge to the 1200 command, got {}",
+            fan.rpm
+        );
+        assert_eq!(fan.mode, FanMode::Manual, "we still own the fan");
+        assert_eq!(sup.write_failures, 0, "tracking is never counted");
+        assert!(!sup.monitor_only, "curve mode must survive every ramp");
+    }
+
+    /// RULING F16 test 2: takeover — mock in Auto with the tach at 6170 while
+    /// a hold command arrives ⇒ manual armed, the write is verified by the
+    /// `fan1_output` echo, no fallback.
+    #[test]
+    fn f16_takeover_from_auto_verifies_by_echo() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(6170, FanMode::Auto);
+        sm.set_tach_lag(1500);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        let rep = sup.step_once();
+        assert_eq!(rep.applied_rpm, Some(3000), "write verified by echo");
+        assert!(sup.manual_armed, "control armed on takeover");
+        assert_eq!(
+            sm.write_attempts(),
+            2,
+            "exactly set_mode(Manual) + one verified write"
+        );
+        assert!(rep.verified);
+        assert_eq!(sup.write_failures, 0, "takeover is not a failure");
+        assert!(!sup.monitor_only);
+    }
+
+    /// RULING F16 test 3: stall — lag mode with the tach frozen ⇒ after
+    /// `STALL_POLLS` the actuator is declared unresponsive: loud error,
+    /// AUTO restored, monitor-only latched.
+    #[test]
+    fn f16_frozen_fan_stall_detector_falls_back() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(6170, FanMode::Auto);
+        sm.set_tach_lag(1500);
+        sm.set_tach_frozen(true); // actuator never responds
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        for _ in 0..STALL_POLLS {
+            sup.step_once();
+        }
+        assert!(sup.monitor_only, "stall must latch monitor-only");
+        let fan = sm.fan();
+        assert_eq!(fan.mode, FanMode::Auto, "AUTO restored after the stall");
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("stall detector")),
+            "loud stall error recorded: {:?}",
+            sup.recent_errors
+        );
+    }
+
+    /// RULING F16 test 4: echo genuinely not taken (fault-injected lag mock)
+    /// ⇒ `VerifyFailed` after K=3 per poll ⇒ counted ⇒ fallback at
+    /// `WRITE_FAIL_FALLBACK` (the counted class survives the ruling).
+    #[test]
+    fn f16_echo_not_taken_falls_back_after_k_and_fallback() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_tach_lag(1500);
+        sm.set_write_stuck(Some(6170)); // register is write-protected glue
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        assert_eq!(
+            sup.step_once().applied_rpm,
+            None,
+            "an unverified echo never commits"
+        );
+        for poll in 2..=3 {
+            sup.step_once();
+            if sup.monitor_only {
+                assert_eq!(poll, 3, "fallback exactly at WRITE_FAIL_FALLBACK=3");
+            }
+        }
+        assert!(sup.monitor_only, "echo failures must fall back");
+    }
+
+    /// RULING F16 test 5: mode drift — the mock flips `fan1_manual` back to
+    /// Auto each poll ⇒ every re-assert is counted ⇒ fallback.
+    #[test]
+    fn f16_mode_drift_counts_and_falls_back() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_tach_lag(1500);
+        sm.set_mode_read_back(Some(FanMode::Auto)); // another agent seizes the fan
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        // Every poll: L1 mode-drift re-assert fails VerifyFailed after K=3
+        // attempts, counted once; fallback latches at WRITE_FAIL_FALLBACK=3.
+        for poll in 1..=3 {
+            sup.step_once();
+            if sup.monitor_only {
+                assert_eq!(poll, 3, "fallback exactly at WRITE_FAIL_FALLBACK=3");
+            }
+        }
+        assert!(sup.monitor_only);
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("fan1_manual manual write error")),
+            "each mode-drift re-assert is recorded: {:?}",
             sup.recent_errors
         );
     }
