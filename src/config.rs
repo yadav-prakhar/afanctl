@@ -4,8 +4,8 @@
 //!
 //! Invariants: `from_toml` rejects thresholds outside the 0..=95 °C band,
 //! `high >= max`, `min_rpm >= max_rpm`, `interval_s < 1` or
-//! `interval_s > MAX_INTERVAL_S` (the unit's `WatchdogSec=15` minus a 1 s
-//! margin, T9-F3), and non-integer or missing keys —
+//! `interval_s > MAX_INTERVAL_S` (the unit's `WatchdogSec=15` minus the
+//! worst-case poll work with ≥3 s margin — RULING F21 R2; T9-F3), and non-integer or missing keys —
 //! always naming the key and the fix (kills H3 and mbpfan's missing≡0 trap).
 //! `load` maps a *missing* file to `defaults()`; a present-but-invalid file is
 //! refused. `validate(hw)` clamps rpms to the hardware band `(fan1_min,
@@ -35,10 +35,18 @@ const KNOWN: &[(&str, &[&str])] = &[
 /// crash-loop.
 pub const WATCHDOG_UNIT_SEC: u64 = 15;
 
-/// Largest legal `poll.interval_s`: the unit's watchdog budget
-/// ([`WATCHDOG_UNIT_SEC`]) minus a 1 s scheduling margin. `Config` rejects
-/// anything above this.
-pub const MAX_INTERVAL_S: u64 = WATCHDOG_UNIT_SEC - 1;
+/// Largest legal `poll.interval_s` (RULING F21 R2): the unit's watchdog
+/// budget ([`WATCHDOG_UNIT_SEC`], 15 s) minus the worst-case in-poll
+/// blocking and a margin. F19's settle windows cost ≈ 2.7 s per failing
+/// `write_speed` (window × (`WRITE_RETRY_MAX` + 1)) and ≈ 1.8 s per failing
+/// `set_mode`; the supervisor pings the watchdog at the start *and* end of
+/// every poll, so a 12 s interval plus its own blocking keeps ≥ 3 s of
+/// margin under the 15 s budget. The former cap (14 = budget − 1) predates
+/// the settle window and let `interval_s = 14` push the ping gap to
+/// ≈ 15.0–15.5 s — past the watchdog, SIGABRT-crash-looping a *healthy*
+/// curve daemon exactly in the oscillating-temperature regime curve mode
+/// exists for.
+pub const MAX_INTERVAL_S: u64 = 12;
 
 /// Typed config: the five user-tunable values (PRD R6). Safety tunables are
 /// named constants in `policy.rs`/`supervisor.rs`, never config.
@@ -331,20 +339,25 @@ fn interval_below_one(v: i64) -> ConfigError {
     }
 }
 
-/// T9-F3: all watchdog pings ride the poll cadence, so a poll period at or
-/// above the unit's `WatchdogSec` budget starves every ping — SIGABRT → L2 →
-/// `Restart=always` crash-loop. State this coupling in the rejection.
+/// T9-F3 + RULING F21 (R2): the watchdog pings ride the poll cadence (two
+/// per poll — start and end), so a poll period at or above the unit's
+/// `WatchdogSec` budget minus the worst-case poll work starves every ping —
+/// SIGABRT → L2 → `Restart=always` crash-loop. State this coupling in the
+/// rejection.
 fn interval_starves_watchdog(v: u64) -> ConfigError {
     ConfigError::Invalid {
         key: K_INTERVAL,
         reason: format!(
             "interval_s ({v}) would starve the systemd watchdog (the unit pins \
-             WatchdogSec={WATCHDOG_UNIT_SEC} s and the supervisor pings exactly \
-             once per poll), crash-looping the daemon (SIGABRT → L2 → Restart=always)"
+             WatchdogSec={WATCHDOG_UNIT_SEC} s, the supervisor pings at the \
+             start and end of every poll, and the F19 settle windows block up \
+             to ≈2.7 s inside a failing write), crash-looping the daemon \
+             (SIGABRT → L2 → Restart=always)"
         ),
         fix: format!(
             "set `interval_s` to at most {MAX_INTERVAL_S} s (the unit's \
-             {WATCHDOG_UNIT_SEC} s watchdog budget minus a 1 s margin)"
+             {WATCHDOG_UNIT_SEC} s watchdog budget minus the worst-case poll \
+             work with ≥3 s margin)"
         ),
     }
 }
@@ -487,23 +500,25 @@ mod tests {
         }
     }
 
-    /// T9-F3: `interval_s` must stay below the unit's `WatchdogSec=15` budget
-    /// (one ping per poll), else the daemon crash-loops. 14 s is legal.
+    /// T9-F3 + RULING F21 (R2): `interval_s` must leave ≥3 s of the unit's
+    /// `WatchdogSec=15` budget for in-poll settle windows (two pings per
+    /// poll). 12 s is the legal cap; the pre-F21-cap value 14 and everything
+    /// above are rejected.
     #[test]
     fn rejects_interval_starving_the_watchdog_budget_f3() {
-        for v in ["15", "20"] {
+        for v in ["13", "14", "15", "20"] {
             let e = err(&toml_with("66", "86", "1200", "6200", v));
             assert_invalid(&e, K_INTERVAL);
             let msg = e.to_string();
             assert!(msg.contains("WatchdogSec=15"), "got `{msg}`");
             assert!(
-                msg.contains("at most 14 s"),
+                msg.contains("at most 12 s"),
                 "fix must name the bound, got `{msg}`"
             );
         }
         let (parsed, warnings) =
-            Config::from_toml(&toml_with("66", "86", "1200", "6200", "14")).expect("14 s is legal");
-        assert_eq!(parsed.interval_s, 14);
+            Config::from_toml(&toml_with("66", "86", "1200", "6200", "12")).expect("12 s is legal");
+        assert_eq!(parsed.interval_s, 12);
         assert!(warnings.is_empty());
         assert!(parsed.validate(HW).is_ok());
     }

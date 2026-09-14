@@ -1,10 +1,11 @@
 //! Run modes, the poll loop, L1 per-poll verify/re-assert, and the
 //! command/state file handling (PRD R3, R4-L1, R7, R8).
 //!
-//! Poll order is exactly: read cmd file → validate/apply mode → read sensors
-//! → controller step → act via smc (verify) → L1 re-assert → write
-//! `state.json` → watchdog ping; `run()` adds the sleep between polls and
-//! arms L2 before notifying READY.
+//! Poll order is exactly: watchdog ping → read cmd file → validate/apply
+//! mode → read sensors → controller step → act via smc (verify) → L1
+//! re-assert → write `state.json` → watchdog ping (RULING F21 R2: pings at
+//! both ends bound the gap a long poll can create); `run()` adds the sleep
+//! between polls and arms L2 before notifying READY.
 //!
 //! Invariants: every write goes through the smc write-verify path; logical
 //! state commits only on verified results; `WRITE_FAIL_FALLBACK` consecutive
@@ -90,9 +91,10 @@ pub struct Supervisor {
     write_failures: u32,
     /// RULING F20 (R1) stall window: consecutive motionless, off-target polls.
     stall_polls: u32,
-    /// RULING F20 (R4): current off-target excursion length and its warn latch.
+    /// RULING F20 (R4) / F21 (R3): current off-target excursion length. The
+    /// dwell WARN repeats every `OFF_TARGET_WARN_POLLS` polls while the
+    /// excursion persists; it resets only on convergence or degradation.
     off_target_polls: u32,
-    off_target_warned: bool,
     /// RULING F20 (R3): set by `run()` when `panic_fd()` was absent — the
     /// "no L2 → observe" invariant then also gates `apply_mode`'s re-arm, so
     /// a cmd file cannot defeat the startup guard on either channel.
@@ -178,7 +180,6 @@ impl Supervisor {
             write_failures: 0,
             stall_polls: 0,
             off_target_polls: 0,
-            off_target_warned: false,
             l2_absent: false,
             hw_min: hw.0,
             hw_max: hw.1,
@@ -193,11 +194,20 @@ impl Supervisor {
         })
     }
 
-    /// Exactly one poll iteration: read cmd file → read sensors → decide →
-    /// act+verify → L1 re-assert → write state.json → watchdog ping. Returns
-    /// the report (testable).
+    /// Exactly one poll iteration: watchdog ping → read cmd file → read
+    /// sensors → decide → act+verify → L1 re-assert → write state.json →
+    /// watchdog ping. Returns the report (testable).
+    ///
+    /// RULING F21 (R2): the watchdog is pinged at the *start* and at the end
+    /// of the poll, so a long (or failing-echo) poll cannot extend the ping
+    /// gap beyond `max(interval, poll_work)` — the settle windows cost up to
+    /// ≈2.7 s per failing write, and an end-of-poll-only ping at
+    /// `interval_s = 14` pushed the gap past the 15 s unit budget.
     pub fn step_once(&mut self) -> StepReport {
         let mut notes = Vec::new();
+        // 0. watchdog ping (L3, RULING F21 R2): upper-bound the gap a long
+        // poll can create; the second ping below closes the poll itself.
+        self.ping_watchdog();
         // 1. command file: validate + apply mode (R8).
         self.apply_cmd_file(&mut notes);
         // 1.5 RULING F20 (R2): while an AUTO restore is pending, one
@@ -226,8 +236,7 @@ impl Supervisor {
         // 5. state.json publish (R7).
         self.publish_state(&decision, applied, verified);
         // 6. watchdog ping (L3). step_once never sleeps: the loop does.
-        self.watchdog_pings += 1;
-        let _ = crate::notify::sd_watchdog();
+        self.ping_watchdog();
         StepReport {
             mode: self.mode.clone(),
             t_eff: self.controller.t_eff(),
@@ -333,7 +342,6 @@ impl Supervisor {
         self.write_failures = 0;
         self.stall_polls = 0;
         self.off_target_polls = 0;
-        self.off_target_warned = false;
         self.auto_restore_pending = false;
         self.auto_restore_attempts = 0;
         self.auto_retry_log_polls = 0;
@@ -466,7 +474,10 @@ impl Supervisor {
             tracing::info!("re-commanded after monitor-only degradation; re-arming control");
             self.monitor_only = false;
             self.write_failures = 0;
-            // Owning the fan again supersedes the pending AUTO release (F20 R2).
+            // Owning the fan again supersedes the pending AUTO release
+            // (F20 R2; RULING F21 R1: the same supersede holds when a fresh
+            // command re-enters control while an observe-release retry was
+            // still pending — re-commanding *is* the fresh owner decision).
             self.auto_restore_pending = false;
             self.auto_restore_attempts = 0;
             self.auto_retry_log_polls = 0;
@@ -481,11 +492,24 @@ impl Supervisor {
                     Ok(_) => {
                         self.manual_armed = false;
                         self.last_written = None;
+                        self.auto_restore_pending = false;
+                        self.auto_restore_attempts = 0;
+                        self.auto_retry_log_polls = 0;
                         notes.push("cmd applied: observe (fan1_manual=0)".into());
                     }
                     Err(e) => {
-                        self.manual_armed = false;
-                        self.last_written = None;
+                        // SAFETY-INVARIANT (RULING F21 R1, the cmd-file
+                        // sibling of F20 R2): a failed release still owns the
+                        // fan — dropping `manual_armed` here strands it in
+                        // Manual, unsupervised (L1 early-returns, nothing
+                        // retries). Keep ownership, arm the every-poll
+                        // `auto_restore_retry`, and record the truth; the
+                        // mode field still becomes Observe (the requested
+                        // intent, and it stops speed commands) but state must
+                        // say the release is pending until it verifies.
+                        self.auto_restore_pending = true;
+                        self.auto_restore_attempts = 1;
+                        self.auto_retry_log_polls = AUTO_RETRY_LOG_POLLS;
                         self.fail_write(format!("cmd observe: set AUTO error: {e}"), notes);
                     }
                 }
@@ -596,8 +620,9 @@ impl Supervisor {
     ///   (beyond `STALL_TACH_EPSILON_RPM`) or the fan is within tolerance; a
     ///   command change never resets the window. `STALL_POLLS` motionless,
     ///   off-target polls ⇒ unresponsive actuator ⇒ loud error, AUTO +
-    ///   monitor-only. Off-target dwell beyond `OFF_TARGET_WARN_POLLS`
-    ///   emits one WARN per excursion (R4, no degradation).
+    ///   monitor-only. Off-target dwell re-warns every
+    ///   `OFF_TARGET_WARN_POLLS` polls while the excursion persists (R4 /
+    ///   F21 R3, no degradation).
     ///
     /// Only mode-drift failures, write-syscall errors and echo failures
     /// increment `write_failures` (`WRITE_FAIL_FALLBACK` → fallback).
@@ -621,7 +646,6 @@ impl Supervisor {
         if !self.manual_armed {
             self.stall_polls = 0;
             self.off_target_polls = 0;
-            self.off_target_warned = false;
             return true; // not ours to verify
         }
         if self.auto_restore_pending {
@@ -659,11 +683,22 @@ impl Supervisor {
             }
             // Stall detector (RULING F20 R1): keyed on tach movement, not on
             // command changes — a moving command cannot buy a dead actuator a
-            // fresh window. Plus off-target dwell visibility (R4).
+            // fresh window. Plus off-target dwell visibility (R4 / F21 R3).
             if dev > VERIFY_TOLERANCE_RPM {
                 self.off_target_polls = self.off_target_polls.saturating_add(1);
-                if !self.off_target_warned && self.off_target_polls >= OFF_TARGET_WARN_POLLS {
-                    self.off_target_warned = true;
+                // RULING F21 (R3): the dwell WARN repeats every
+                // `OFF_TARGET_WARN_POLLS` polls while the excursion persists
+                // (≈ one line per 30 s at default cadence) — a permanently
+                // off-target fan must not fall silent after one WARN.
+                // Deliberate trade-off: the stall criterion keys on *any*
+                // tach movement (RULING F20 R1 as ruled — both alternative
+                // criteria fail worse), so a fan that jitters beyond
+                // `STALL_TACH_EPSILON_RPM` while parked off target is
+                // reported, repeatedly, not degraded: a per-poll criterion
+                // cannot separate "jittering but never converging" from
+                // "healthily chasing without converging yet". The excursion
+                // counter resets only on convergence (below) or degradation.
+                if self.off_target_polls.is_multiple_of(OFF_TARGET_WARN_POLLS) {
                     let msg = format!(
                         "fan rpm off target for {} polls (moving, not stalled)",
                         self.off_target_polls
@@ -690,17 +725,16 @@ impl Supervisor {
                         notes.push(msg);
                         self.stall_polls = 0;
                         self.off_target_polls = 0;
-                        self.off_target_warned = false;
                         self.degrade_to_auto(notes);
                         return false;
                     }
                 }
             } else {
-                // Within tolerance: progress by definition; one fresh
-                // excursion later warns again (R4: once per excursion).
+                // Within tolerance: progress by definition; the excursion
+                // closes and a fresh one warns again from a fresh window
+                // (the repeating WARN resets only here or on degradation).
                 self.stall_polls = 0;
                 self.off_target_polls = 0;
-                self.off_target_warned = false;
             }
         }
         if failed {
@@ -742,7 +776,6 @@ impl Supervisor {
         self.write_failures = 0;
         self.stall_polls = 0;
         self.off_target_polls = 0;
-        self.off_target_warned = false;
         match self.smc.set_mode(FanMode::Auto) {
             Ok(_) => {
                 self.manual_armed = false;
@@ -810,7 +843,6 @@ impl Supervisor {
         self.last_written = None;
         self.stall_polls = 0;
         self.off_target_polls = 0;
-        self.off_target_warned = false;
         let msg = format!(
             "AUTO restored after {} attempts (fan1_manual=0, verified)",
             self.auto_restore_attempts
@@ -821,6 +853,13 @@ impl Supervisor {
     }
 
     // ---- step 5: state.json (R7) ----
+
+    /// One WATCHDOG=1 notification (L3). RULING F21 (R2): sent at the start
+    /// and at the end of every poll.
+    fn ping_watchdog(&mut self) {
+        self.watchdog_pings += 1;
+        let _ = crate::notify::sd_watchdog();
+    }
 
     /// Append a bounded recent_errors entry.
     fn note_recent(&mut self, msg: String) {
@@ -1071,6 +1110,9 @@ mod tests {
         fn set_tach_frozen(&self, frozen: bool) {
             self.smc().set_tach_frozen(frozen);
         }
+        fn set_latency(&self, latency: Option<std::time::Duration>) {
+            self.smc().set_latency(latency);
+        }
         fn write_attempts(&self) -> u32 {
             self.smc().write_attempts()
         }
@@ -1139,19 +1181,20 @@ mod tests {
         assert_eq!(state["actual_rpm"], 1950);
         assert_eq!(state["verified"], true);
         assert_eq!(
-            state["watchdog_pings"], 0,
-            "state is published before the ping (binding poll order)"
+            state["watchdog_pings"], 1,
+            "state is published between the two pings (start ping counted, end ping not yet — binding poll order, RULING F21 R2)"
         );
         assert_eq!(state["recent_errors"], serde_json::json!([]));
         assert_eq!(
             state["monitor_only"], false,
             "healthy daemon is not latched"
         );
-        // Second poll: decision moves up the slew; the ping counter lands at 1.
+        // Second poll: decision moves up the slew; the ping counter lands
+        // at 2·2−1 = 3 (two pings per poll, publish between them).
         let before = sup.step_once();
         assert_eq!(before.applied_rpm, Some(2700));
         assert!(before.verified);
-        assert_eq!(dir.state()["watchdog_pings"], 1);
+        assert_eq!(dir.state()["watchdog_pings"], 3);
     }
 
     /// Card check: observe startup never writes (firmware owns the fan, R3).
@@ -1787,6 +1830,146 @@ mod tests {
         assert_eq!(dir.state()["auto_restore_pending"], false);
     }
 
+    // ---- RULING F21 ----
+
+    /// RULING F21 (R1, ticket test 1 — the probe-B MAJOR regression): the
+    /// fan is owned and a `hold` command is active; the observe release's
+    /// own `set_mode(Auto)` fails ⇒ `manual_armed` STAYS true, the pending
+    /// flag arms, nothing claims "cmd applied", and state renders the truth
+    /// (`monitor_only` false, `auto_restore_pending` true). Then the fault
+    /// clears and the every-poll retry releases the fan with the
+    /// "after N attempts" note.
+    #[test]
+    fn f21_failed_observe_release_keeps_ownership_and_retries() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once(); // manual armed + 3000 written (fan is ours)
+        assert!(sup.manual_armed);
+        sm.set_mode_read_back(Some(FanMode::Manual)); // mode writes never verify
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"observe"}"#);
+        let rep = sup.step_once();
+        assert_eq!(
+            rep.mode,
+            RunMode::Observe,
+            "the mode field still becomes the requested intent"
+        );
+        assert!(
+            sup.manual_armed,
+            "a failed release must NOT drop ownership (the F21 MAJOR)"
+        );
+        assert!(sup.auto_restore_pending, "the release retry must arm");
+        assert!(
+            !rep.notes.iter().any(|n| n.contains("cmd applied")),
+            "no false applied claim: {:?}",
+            rep.notes
+        );
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("cmd observe: set AUTO error")),
+            "the failure must be recorded: {:?}",
+            sup.recent_errors
+        );
+        assert_eq!(sm.fan().mode, FanMode::Manual, "the fan is still Manual");
+        let state = dir.state();
+        assert_eq!(state["mode"], "observe");
+        assert_eq!(state["monitor_only"], false);
+        assert_eq!(
+            state["auto_restore_pending"], true,
+            "the pending flag is the truth the state must render"
+        );
+
+        sm.set_mode_read_back(None); // the fault clears
+        sup.step_once();
+        assert!(!sup.auto_restore_pending, "the retry cleared the flag");
+        assert!(!sup.manual_armed, "the fan is released");
+        assert_eq!(sm.fan().mode, FanMode::Auto, "fan1_manual=0");
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("AUTO restored after 3 attempts")),
+            "release completes via the retry with the attempts note: {:?}",
+            sup.recent_errors
+        );
+        // attempts: 1 armed at the failure + the arming poll's own retry
+        // (2) + the next poll's successful retry (3).
+    }
+
+    /// RULING F20 R2 / F21 (R1) killer for T9c finding 7: a variant that
+    /// retries the AUTO restore only on alternate polls must FAIL — every
+    /// pending poll attempts `set_mode(Auto)`, observable as a write-attempt
+    /// delta on every poll (monitor-only latching is false here, so the
+    /// retry is the only writer).
+    #[test]
+    fn f21_auto_restore_retry_genuinely_attempts_every_poll() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once();
+        sm.set_mode_read_back(Some(FanMode::Manual));
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"observe"}"#);
+        sup.step_once(); // release fails, pending armed
+        assert!(sup.auto_restore_pending);
+        for poll in 1..=3 {
+            let before = sm.write_attempts();
+            sup.step_once();
+            let after = sm.write_attempts();
+            assert!(
+                after > before,
+                "poll {poll}: the AUTO retry must attempt EVERY poll (delta was 0)"
+            );
+            assert!(
+                sup.auto_restore_pending,
+                "still pending while the fault holds"
+            );
+        }
+        sm.set_mode_read_back(None);
+        sup.step_once();
+        assert!(
+            !sup.auto_restore_pending,
+            "a clearing fault completes the release"
+        );
+    }
+
+    /// RULING F21 (R2) observable: state.json is published BETWEEN the two
+    /// pings, so after poll N the published count is 2N−1 — the start ping
+    /// already counted, the end ping not. An end-only-ping variant publishes
+    /// N−1 (0,1,2); a start-only variant N (1,2,3); both fail this pin.
+    #[test]
+    fn f21_watchdog_pings_at_start_and_end_of_each_poll() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once();
+        assert_eq!(dir.state()["watchdog_pings"], 1, "poll 1: 2·1−1");
+        sup.step_once();
+        assert_eq!(dir.state()["watchdog_pings"], 3, "poll 2: 2·2−1");
+        sup.step_once();
+        assert_eq!(dir.state()["watchdog_pings"], 5, "poll 3: 2·3−1");
+    }
+
+    /// RULING F21 (R2) consequence: even a poll blocked on slow smc work
+    /// (injected latency) publishes a count that already includes its start
+    /// ping — the gap cannot exceed `max(interval, poll_work)`.
+    #[test]
+    fn f21_long_poll_still_pings_at_its_start() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_latency(Some(std::time::Duration::from_millis(60)));
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once();
+        assert_eq!(
+            dir.state()["watchdog_pings"],
+            1,
+            "a long poll must not defer the start ping past its own work"
+        );
+    }
+
     /// RULING F20 test 4 (R3): with no L2 death path, a cmd.json writing mode
     /// is refused — observe stays, zero writes, error recorded.
     #[test]
@@ -1831,10 +2014,12 @@ mod tests {
         assert!(sup.monitor_only, "stall fires at exactly STALL_POLLS");
     }
 
-    /// RULING F20 test 6 (R4): off-target dwell warns exactly once per
-    /// excursion at `OFF_TARGET_WARN_POLLS`, and moving tachs never stall.
+    /// RULING F20 test 6 (R4) / F21 (R3): the off-target dwell WARN fires at
+    /// exactly `OFF_TARGET_WARN_POLLS` per excursion and the counter resets
+    /// on convergence, so a fresh excursion warns again (the *repeating*
+    /// warn within one long excursion is pinned in `tests/pin_constants.rs`).
     #[test]
-    fn f20_off_target_dwell_warns_once_per_excursion() {
+    fn f20_off_target_dwell_warns_at_window_and_resets_on_convergence() {
         let dir = TempDir::new();
         dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
         let sm = mock_with(vec![hot()]);
@@ -1877,7 +2062,10 @@ mod tests {
             .iter()
             .filter(|e| e.msg.contains("(moving, not stalled)"))
             .count();
-        assert_eq!(warns_before, 1, "exactly one warn per excursion");
+        assert_eq!(
+            warns_before, 1,
+            "excursion 1 (length == one window) warned exactly once"
+        );
         for i in 1..=OFF_TARGET_WARN_POLLS {
             sm.set_fan_state(if i % 2 == 0 { 2760 } else { 2700 }, FanMode::Manual);
             sup.step_once();

@@ -330,3 +330,24 @@ Behaviorally identical on the real backend (the verdict can never change
 after startup); the invariant now holds on both channels — startup mode and
 cmd.json re-arming — which is R3's acceptance point. Flagged per the
 cross-agent protocol; unambiguous remainder implemented.
+
+### N-F21-1 (consequence of RULING F21 R2, cli.rs is read-only on this ticket): `daemon.uptime_s` now counts two pings per poll
+
+RULING F21 R2 pings the watchdog at the start AND at the end of every poll,
+so `state.json.watchdog_pings` now advances by 2 per poll instead of 1.
+`cli.rs` (read-only for F21) renders `daemon.uptime_s = watchdog_pings ×
+interval_s` (D-T9-F7 approximation, whose doc says "the daemon pings once
+per poll") — that approximation now reports ≈2× the true uptime. No schema
+or signature change is needed; options for the orchestrator: (a) cli divides
+by 2 with the constant as the source of truth, (b) supervisor publishes a
+separate poll counter, (c) accept and re-document. Flagged per the
+cross-agent protocol; not silently "fixed" outside the owned file set.
+
+### N-F21-2 (doc drift, DESIGN.md is read-only on this ticket): Appendix A `step_once` comment and Appendix B example
+
+DESIGN.md Appendix A still describes the poll order as "…write state.json →
+watchdog ping" (single end ping); F21 R2 makes it two pings (start + end),
+and Appendix B's `watchdog_pings` example should note the two-per-poll
+semantics. Source doc not in F21's owned file list — needs a one-line
+re-render by the orchestrator. The in-code module doc in `src/supervisor.rs`
+and all owned docs were updated.
