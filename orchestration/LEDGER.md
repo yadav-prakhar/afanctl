@@ -26,3 +26,6 @@
   (AFANCTL_RUNTIME_DIR) now spec. LOC overages config.rs/smc.rs/cli.rs noted, within stop-and-report rule.
 
 - [A1 pending] T5 next.
+- [fix ticket F1] T4 notify tests race on NOTIFY_SOCKET process env (abstract_socket_form_reaches_listener
+  flakes ~10-30%% under parallel test threads; passes serialized). File owned by T4. Bounce to T4 model
+  with failing output. Discovered during T5 verification (T5's larger suite raised flake probability).
