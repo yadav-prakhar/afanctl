@@ -323,3 +323,27 @@
   the F19/F20 constants and the two cadences by value and behaviour. Ticket
   `orchestration/instructions/F21.md` dispatched on `fix/observe-release` (glm-5.3-flash high); a narrow
   T9d review of F21 follows before gate (f) is declared clean.
+- [F21 — MERGED + VERIFIED] branch `fix/observe-release` (1c8d033) merged; gates green (160 tests). Verified
+  in source: the observe branch now keeps `manual_armed`, sets `auto_restore_pending`/`attempts` and calls
+  `fail_write` for the truthful record while still moving `mode` to Observe (the requested intent), so the
+  every-poll retry completes the release; `ping_watchdog()` is called at the start **and** the end of
+  `step_once`; `MAX_INTERVAL_S = 12`; the dwell WARN repeats (no latch) and resets only on convergence.
+  Tests: `f21_failed_observe_release_keeps_ownership_and_retries`,
+  `f21_auto_restore_retry_genuinely_attempts_every_poll`,
+  `f21_watchdog_pings_at_start_and_end_of_each_poll`, `f21_long_poll_still_pings_at_its_start`,
+  `f21_constants_are_pinned_by_value`, `f21_max_interval_cap_12_legal_and_14_rejected`,
+  `f20_off_target_dwell_warns_at_window_and_resets_on_convergence`,
+  `f21_sub_epsilon_jitter_while_off_target_is_motionless_and_stalls`,
+  `f21_super_epsilon_jitter_never_stalls_but_warns_repeatedly`. Package rebuilt 22:14.
+- [F22 — RULED + MERGED] F21's implementer flagged `N-F21-1` honestly instead of reaching into a file it
+  did not own: with two pings per poll, `watchdog_pings` advances 2×, so the plugin-facing
+  `daemon.uptime_s` (pings × interval) reported double. RULING F22 = publish a real additive `polls`
+  counter (once per completed poll; `watchdog_pings` keeps its L3 meaning) and compute `uptime_s` from it,
+  with a documented fallback for a state file from an older build; the test that *pinned the wrong
+  arithmetic* was corrected rather than worked around. Merged (aa93070) — gates green (162 tests), product
+  delta small, `tests/schema.rs` + README updated. DESIGN.md Appendix B example now carries `polls`.
+  Orchestrator also amended Appendix A's `step_once` comment for the two-ping order (`N-F21-2`).
+- [T9d — DISPATCHED] final review round (F21+F22) with a mandatory **CLOSE / DO-NOT-CLOSE** judgement on
+  the review gate, a re-trace of every path that clears `manual_armed`, a recomputation of the watchdog
+  margin at `interval_s = 12`, and a last sweep for remaining fixture-shaped assumptions (with what the
+  hardware gate can and cannot cover). Package rebuilt 22:24.
