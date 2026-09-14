@@ -6,7 +6,7 @@ xdata = pkgtype=debug
 pkgver = 0.1.0-1
 pkgdesc = Detached debugging symbols for afanctl
 url = https://example.invalid/afanctl
-builddate = 1789404226
+builddate = 1789404863
 packager = Unknown Packager
 size = 3472
 arch = x86_64

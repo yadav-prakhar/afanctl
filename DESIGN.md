@@ -214,7 +214,8 @@ pub fn sd_status(msg: &str) -> bool;   // STATUS=…
 ```json
 { "schema": "afanctl.state.v1", "ts": "…", "mode": "curve", "t_eff_c": 71.2,
   "target_rpm": 3400, "last_written_rpm": 3350, "actual_rpm": 3390,
-  "verified": true, "monitor_only": false, "auto_restore_pending": false, "watchdog_pings": 981, "recent_errors": [ … last 5 … ] }
+  "verified": true, "monitor_only": false, "auto_restore_pending": false, "polls": 981,
+  "watchdog_pings": 1962, "recent_errors": [ … last 5 … ] }
 ```
 
 ### Appendix C — doctor output (human; `--json` reuses the same fields)
