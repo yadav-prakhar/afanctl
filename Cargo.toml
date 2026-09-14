@@ -1,0 +1,26 @@
+[package]
+name = "afanctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+description = "applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+libc = "0.2"
+
+[features]
+# Hardware-in-the-loop tests: only compile/run with --features hw AND env
+# AFANCTL_HWTEST=1 AND real applesmc present (PRD R10 / §8). Never in CI.
+hw = []
+
+[profile.release]
+# R11: binary < 2 MB, RSS < 5 MB
+strip = true
+lto = true
