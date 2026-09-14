@@ -197,6 +197,33 @@
 - [HW DYNAMICS — measured 2026-09-14 20:47, for the mock] full-swing response ≈ 3000 rpm/s downward
   (6688→2664 in 1 s), ~5 s to settle, ±20 rpm steady-state, small overshoot (1626 → 1940 before
   settling at ~2000). Mock lag defaults should reflect this, not the idealized 1500 rpm/poll sketch.
+- [T9b — REVIEW GATE ROUND 2: **FAIL**] report merged (`orchestration/REVIEW-T9b.md`, 240 lines).
+  F14/F16/F18 each verified compliant *with kill-analysis* (the reviewer named the change that would
+  break each ruling test), plus contract hygiene clean (no unsafe outside safety.rs, zero
+  unwrap/expect/panic in product code, deps exactly the allowlist, no println outside cli.rs). Findings:
+  **2 MAJOR proven live + 7 MINOR**. Orchestrator re-verified both majors in source:
+  (1) `src/supervisor.rs:593-608` — the stall window resets on every *command change*, so during curve
+  slew or mid-band temp oscillation it never reaches `STALL_POLLS`: a frozen fan stays invisible
+  (`verified: true`, `monitor_only: false`, empty `recent_errors`) while temps oscillate — the old
+  tach-counting code caught it. (2) `src/supervisor.rs:648-680` — `degrade_to_auto` sets
+  `manual_armed = false` even when its own `set_mode(Auto)` **failed**, so L1's mode check switches off,
+  `monitor_only` stops all writes, nothing re-attempts AUTO, and the success line "AUTO restored" is
+  printed anyway: a fan left in Manual is stranded, unsupervised, until a *changed* command or process
+  death. Also noted: T9b's "assumptions that only hold on fixtures" section independently flagged the
+  `F0Tg`-echo latency class *before* the 20:47 measurement, and its finding 6 (no test pins the ruled
+  constant values) plus finding 8 (the F18 evidence line has no test) are real test gaps.
+- [F20 — RULED] DESIGN.md constants list updated with all ruled constants (F16/F19/F20). RULING F20
+  closes both majors without re-adding F16's false positives: (R1) stall detector keyed to **tach
+  movement** (`STALL_TACH_EPSILON_RPM = 50`) instead of command changes — a real fan's tach always
+  moves when commanded elsewhere (measured: 6688 → 2001 in ~5 s, ±20 at rest); a frozen actuator's does
+  not, so neither a moving command nor mid-band oscillation can buy a dead fan a fresh lease;
+  (R2) failed AUTO restore stays truthful and recoverable: keep `manual_armed`, add
+  `auto_restore_pending`, retry every poll (log rate-limited every `AUTO_RETRY_LOG_POLLS = 10`), only
+  claim success on a verified read-back, and expose the flag additively in state.v1/status.v1;
+  (R3) `apply_mode` honours the no-L2→observe invariant on the cmd-file channel too; (R4) off-target
+  dwell (`OFF_TARGET_WARN_POLLS = 30`) becomes visible without degrading; (R5) README L1 + foreign-owner
+  wording, constant-boundary pinning tests, evidence-line test. Ticket `orchestration/instructions/F20.md`
+  rendered — **held until F19 merges** (same files: supervisor.rs/policy.rs/tests).
 - [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
   fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
   now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift

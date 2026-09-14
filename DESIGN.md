@@ -105,6 +105,13 @@ pub const SENSOR_LOSS_POLLS: u32 = 3;
 pub const OVERSHOOT_POLLS: u32 = 3;
 pub const VERIFY_TOLERANCE_RPM: u32 = 150;   // consumed by supervisor L1
 pub const WRITE_FAIL_FALLBACK: u32 = 3;
+pub const WRITE_ECHO_TOLERANCE_RPM: u32 = 50; // RULING F16: fan1_output register echo
+pub const STALL_POLLS: u32 = 10;              // RULING F16/F20: unresponsive-actuator window
+pub const ECHO_SETTLE_MS: u64 = 1500;         // RULING F19: SMC adopts F0Tg on a ~1s tick
+pub const MODE_SETTLE_MS: u64 = 1000;         // RULING F19: same, for the FS! manual bit
+pub const STALL_TACH_EPSILON_RPM: u32 = 50;   // RULING F20: "the tach is not moving at all"
+pub const AUTO_RETRY_LOG_POLLS: u32 = 10;     // RULING F20: rate-limit the failed-AUTO log
+pub const OFF_TARGET_WARN_POLLS: u32 = 30;    // RULING F20: visibility for a slow/dead-ish fan
 
 #[derive(Debug, PartialEq)]
 pub enum Decision { Observe, SetSpeed(u32), EscalateMax, ReturnToAuto }
