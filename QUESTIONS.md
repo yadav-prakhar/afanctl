@@ -89,10 +89,36 @@ No behavior beyond the default was invented; flagging the seam.
   + direct-sysfs merge (R7).
 
 ### Q-T6-3: `cli.rs` LOC vs the §7 budget (~200)
-
 `src/cli.rs` is ~650 lines (`wc -l`, tests included) at PHASE (a) scope: the
 exact R5 parser + parser-table tests, all-verb dispatch, Appendix B/C
 formatting, and exit-code discipline. §7 budgets cli.rs at ~200 (±20% = 240).
 Flagged rather than silently absorbed (PLAN §2 rule). Options: (a) accept as
 PHASE-a scope and let PHASE (b) refactor to fit; (b) split Appendix B/C
 formatting into PHASE (b) or its own module. Awaiting the planner's ruling.
+
+### Q-T5-1: `state.json` schema id — card ruling says `afanctl.status.v1`, PRD/DESIGN say `afanctl.state.v1`
+
+The T5 card's "RULINGS SINCE" block states: `state.json 'afanctl.status.v1'`. But PRD R7 says the
+daemon publishes `/run/afanctl/state.json` "schema `afanctl.state.v1`, Appendix B", and Appendix B
+defines a distinct `afanctl.state.v1` file schema (`afanctl.status.v1` is the `status --json`
+output schema, which cli.rs T6 already emits). I implemented `"schema": "afanctl.state.v1"` in
+the state file (two matching BINDING sources vs one probable typo in the ruling block), and all
+state-file fields follow Appendix B's state example (mode/t_eff_c/target_rpm/last_written_rpm/
+actual_rpm/verified/watchdog_pings/recent_errors — note Appendix B's state doc lacks `ts`; I emit
+it anyway per the example object). One-word flip if ruled otherwise.
+
+### Q-T5-2: noticed pre-existing flake (T4 territory, not touching)
+
+`cargo test --features hw`: `notify::tests::live_socket_receives_ready_and_status` fails
+intermittently (UnixDatagram send/recv race in the test harness itself — plain `cargo test` is
+unaffected). Reported here for the planner; `src/notify.rs` is read-only for T5.
+
+### Q-T5-3: `supervisor.rs` LOC vs the §7 budget (~250)
+
+Product code is ~630 lines (tests co-located excluded; §7 budget ~250, ±20% = 300). Drivers: the
+binding poll order spans cmd-file parsing/validation (R8), mode-machine entry/leave via
+write-verified `set_mode` (R3), act/verify, L1 counter + fallback + freshness gate (R4), atomic
+`state.json` publish (R7), `run()` wiring, plus a hand-rolled RFC3339 UTC timestamp (no extra
+dependency allowed) and the Appendix-A required testable `StepReport`. Same class of overage as
+Q-T6-3 (`cli.rs` 650 vs 200). The alternative — thinning tests — violates §8 ("every behavioral
+claim must have a test"). Awaiting the planner's ruling (split? accept?).
