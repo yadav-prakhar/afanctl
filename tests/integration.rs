@@ -340,7 +340,7 @@ fn hold_cmd_is_applied_by_daemon_within_one_poll() {
     let fixture = Fixture::new();
     // One long poll: the daemon performs the first step immediately, then
     // sleeps, so the assertions cannot race a second decision.
-    let cfg = config(&run_dir, 30);
+    let cfg = config(&run_dir, 10); // legal long poll (< the 14 s watchdog cap)
 
     let hold = run(
         &run_dir,
