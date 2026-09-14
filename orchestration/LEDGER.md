@@ -33,3 +33,10 @@
 - [F1 fixed] t4-fix1 used OnceLock<Mutex<()>> env-lock serialization (shape (a), no sig change);
   5x consecutive green verified pre-rebase, 3x post-rebase; merged 4e5ee6e. 0 residual flake.
 - [A1 NEXT] Wave-2 complete. A1 audits after T5 per PRD §11.4 — running next.
+- [A1 PASS, 2026-09-14] audits: unsafe confined to safety.rs (4/4 SAFETY comments); /sys paths only in smc.rs;
+  product-code unwrap/expect/panic = 0 (78 raw hits all inside #[cfg(test)] blocks — brace-matched verification);
+  deps exactly the R11 allowlist; release binary smoke: --version ok, no-args exit 2 + usage,
+  status reads fixture sensors + fan + defaults, hold writes cmd.json via AFANCTL_RUNTIME_DIR,
+  once reaches verified SetSpeed against fixture. doctor stub exits 101 loudly (T7 owns body).
+  LOC: supervisor.rs 1082 / smc.rs 887 / cli.rs 649 / config.rs 535 / policy.rs 336 — overages
+  stop-and-reported by owners, deprioritized to T9 ruling.
