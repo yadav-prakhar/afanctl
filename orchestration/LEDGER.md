@@ -13,7 +13,7 @@
 | T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a) | 1 | 0 | 0 | 815d0fa |
 | T7 | doctor | deepseek-v4.1-flash | t7-doctor | MERGED | 2 | 0 | 1 | a71b9f4 |
 | T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | MERGED | 2 | 0 | 1 | 9b6aa9d |
-| T9 | review gate | glm-5.3-flash/high | t9-review | REPORTED | 1 | 0 | 0 | (report merged) |
+| T9 | review gate | glm-5.3-flash/high | t9-review | CLOSED | 1 | 0 | 0 | (tickets merged) |
 
 <!-- statuses: PENDING · DISPATCHED · VERIFYING · BOUNCED(n) · MERGED · BLOCKED · ESCALATED -->
 
@@ -59,3 +59,16 @@
   (unwrap/expect/panic lints not enforced; 128 violations appear when flags added — all in tests);
   F5 reproduced (negative thresholds → policy.rs:195 overflow panic in debug). Minors F6–F13 accepted
   as reported by T9 (repro consistent with code), to be batched. Fix tickets F1–F5 + polish ticket next.
+- [FIX ROUND COMPLETE] Ticket A (F1 F2 F7 F8 F12) + Ticket B (F3 F4 F5 F6 F10 F11 F13-doc) merged;
+  mechanical lint-attr completion for cfg(test)/integration files (cbb90b3). ALL findings re-verified live:
+  F1 once→fan1_manual==0 CODE=0 ✓; F2 doctor reads fixture (t_eff 45.0, fixture provenance) ✓;
+  F3 interval_s=20 rejected exit 1 key+fix ✓; F5 exit 1 key+fix no panic ✓; F4 lints enforced green ✓.
+  Tests: 103 unit + integration + traces + schema, all green; all four §8 gates green on main.
+- [STATUS] Build complete pending §9.3/§9.4 user-supervised hardware gate. Final report below.
+
+## Final report (2026-09-14)
+- 11 tasks (S0-T9) + 2 fix tickets (F1 notify-race, T9 fixes) executed by 11 subagent dispatches + 3 fix dispatches.
+- Index shows: every task MERGED. Bounces: 0 quality bounces; 2 dispatch deaths (T7/T8 attempt 1, exit 140-adjacent, re-dispatched).
+- Rulings: D1, D-T6-1, T3-N2, T1 Q-T1-1, T6 Q-T6-1, D-T6-1, D-T8-1, T9 F2-doctor-sig — all adjudicated & propagated.
+- LOC: product ~3.5k (over budget, stop-and-reported, weighed by T9 as quality risk; not a defect).
+- Remaining for user: §9.3 a-g checklist + makepkg -si (Appendix P5 in PLAN.md; ve PRD §9.3/9.4).
