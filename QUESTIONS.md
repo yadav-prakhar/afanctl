@@ -178,3 +178,57 @@ already returns a formatted `String`, so `{:.1}` truncated it (45.0 °C rendered
 as `4`). Fixed by interpolating directly (`"{} C"`), locked by
 `status_human_renders_full_temperatures`. JSON output was unaffected.
 
+
+## T7 — doctor
+
+### Q-T7-1: `doctor::run` has no channel for `--sysfs-root` / `--config`
+
+The frozen signature `pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32`
+(D-T6-1 ruling) carries neither the sysfs root nor the config path, and `cli.rs::run_doctor`
+does not forward the parsed `globals` (it calls `crate::doctor::run(roundtrip, compare_secs, json)`).
+Consequence: on the CLI path `afanctl doctor --sysfs-root <fixture>` **silently ignores the
+flag**; doctor always targets `/sys` + `/etc/afanctl/afanctl.toml`. There is no blessed sysfs
+env seam (T8-drops-env-var ruling), so this cannot be worked around.
+
+Resolution used: `run` delegates to a **private** `run_at(root, config_path, ...)` seam, which
+is what the unit tests drive against fixture trees/tempdirs. No public item was added or renamed.
+Options for the planner: (a) extend the binding signature with `root`/`config` (needs a DESIGN
+amendment + a T6 `cli.rs` one-liner), (b) bless an `AFANCTL_SYSFS_ROOT` / `AFANCTL_CONFIG` env
+seam, or (c) accept (c) as-is (doctor's real consumer is the supervised hardware gate §9.3,
+which runs against default `/sys` anyway). Flagging rather than inventing spec.
+
+### Q-T7-2 (safety finding, cli.rs-owned): cli test drives `doctor --roundtrip` against real `/sys`
+
+`src/cli.rs::tests::doctor_stub_maps_panic_to_exit_1` calls
+`run_doctor(true, true, Some(1))`, i.e. `doctor::run(roundtrip=true, compare=Some(1), json=false)`
+with the default root `/sys`. Now that the body is implemented this reaches real hardware.
+Mitigation already inside `doctor.rs`: `--roundtrip` **refuses to write** unless the L2 fd is
+armed (`panic_fd()` is `Some`), i.e. only root + writable `fan1_manual`. On this box tests run as
+uid 1000, so `fan1_manual` (`-rw-r--r-- root`) yields `None` and the check fails out before any
+`set_mode`/`write_speed` call — verified: `doctor --roundtrip` exits 1 with "refused to write".
+Residual hazard: if `cargo test` is ever run **as root on the A1708**, that pre-existing test
+would perform a real 2 s manual-mode write + restore. It is not fixable from `src/doctor.rs`
+(cli.rs is T6-owned); recommend T6 update the test to the tempdir/`run_at` seam or hw-gate it.
+
+### N-T7-1 (note): `src/doctor.rs` LOC vs the §7 budget (~200)
+
+641 product lines + 419 `#[cfg(test)]` lines = 1060 total. Over the ~200 budget (even at +20%).
+The overage is the mandated R5 surface itself: 8 checks with distinct FAIL/WARN/PASS semantics,
+the root-taking test seam, the `--roundtrip` write/restore path, `--compare` sampling + pure
+comparison math + verdict, and both Appendix-C renderings (human + `--json`) plus their tests.
+Same class as Q-T1-N, Q-T3-1, Q-T5-3, N-T6-2; reported per §8, not absorbed silently.
+
+### N-T7-2 (note): write-path audit for the orchestrator emphasis
+
+`grep -nE "write_speed|set_mode|fs::write|OpenOptions|File::" src/doctor.rs` hits only inside
+`roundtrip_manual_test` (`set_mode(Manual)`, `write_speed(hw_min)`, `set_mode(Auto)` restore).
+No `/sys/` path string occurs in doctor.rs; no `println!`/`print!` (stdout via `write_all`).
+Caveat: the read-only checks call `SysfsSmc::open`, which internally pre-opens `fan1_manual`
+`O_WRONLY` (no write syscall) — that is `smc`'s established behavior (status/once use it too),
+not a doctor write path.
+
+### N-T7-3 (note): `doctor --json` schema id
+
+Appendix C mandates "`--json` reuses the same fields" but names no schema token. Emitted
+`"schema": "afanctl.doctor.v1"` to match the repo's versioned-schema convention. One-word change
+if the planner wants a different id.

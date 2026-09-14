@@ -99,3 +99,16 @@ to DESIGN.md (incl. the D1-approved `{value}` display).
 - **Affected tasks:** T7 (owns the output), T8 (`doctor` integration), T6 PHASE (b).
 
 *(no other deviations; the frozen signatures are otherwise used as written)*
+
+---
+
+## T7 — doctor
+
+### N (note, not a deviation): no contract change; private `run_at` test seam
+
+`doctor::run` is implemented exactly as the D-T6-1 ruling amended it
+(`pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32`); no Appendix-A
+item was renamed or added. Fixture-level tests drive a **private** `run_at(root, config_path,
+roundtrip, compare_secs, json)` helper (not exported), so the frozen public surface is unchanged.
+Two spec gaps found while implementing are logged as Q-T7-1/Q-T7-2 in QUESTIONS.md (doctor cannot
+receive `--sysfs-root`/`--config`; a cli-owned test reaches real `/sys` with `--roundtrip`).
