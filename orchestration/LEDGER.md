@@ -89,6 +89,26 @@
 - [HW GATE (c) — PASS] `selftest-panic`: panic at src/safety.rs:81, exit 101; `/sys/.../fan1_manual` == 0
   after → L2 death path proven on real hardware (the C1 defect class is dead).
 - [NOTE] P5 ordering: `d` needs the installed unit, so §9.4 `makepkg -si` must precede `d`; P5 annotated.
+- [HW GATE (d) — in progress] unit installed (§9.4 install half user-run); `systemctl start afanctl`
+  → active (running), Main PID, `Status: "mode=observe"`, RSS peak 2.4M, NRestarts=0 after >15 s with
+  WatchdogSec=15 (proves READY=1 via Type=notify AND live watchdog pings); `afanctl status` as the
+  normal user reads /run/afanctl/state.json (root:root 0644) → plugin render feed works without sudo;
+  fan 1658 rpm manual=false → observe writes nothing, SMC curve still owns the fan. Soak pending.
+- [DEFECT F14 — CRITICAL, found by orchestrator during gate (d)] `Supervisor::run()` has **no startup
+  reconcile**: SIGKILL (uncatchable) in curve mode kills the process with `fan1_manual == 1`; systemd
+  restarts in observe mode, which writes nothing by design (R3) ⇒ nothing restores AUTO, fan stays
+  manual at the last curve speed indefinitely and silently = **mbpfan C1 class resurrected**. PRD §9.3e
+  ("L2 already restored AUTO") names a mechanism impossible for an uncatchable signal; its *property*
+  is the real bar. Verified in code (src/supervisor.rs `run()` + `RunMode::Observe => Decision::Observe
+  => None`) and in tests: integration covers SIGTERM only ("SIGTERM (not SIGKILL) so the L2 handler
+  runs"). Fix ruled + frozen in DESIGN.md (RULING F14): arm L2 → reconcile (Manual ⇒ restore AUTO,
+  verified write, loud log; failure ⇒ observe + monitor_only) → sd_ready → loop; plus one startup
+  info! line (journal currently carries only systemd's lines, so §9.3d has no app-side evidence).
+  Ticket F14 dispatched (glm-5.3-flash high). P5 (e) and (f) marked BLOCKED until it lands.
+- [MINOR F15 (deferred, user's call)] non-root `afanctl status` prints the smc discovery WARN
+  "cannot pre-open fan1_manual O_WRONLY; L2 death path unavailable (os error 13)" before its human
+  output. Honest but misleading on a read-only path the plugin/polkit rule is designed to allow;
+  candidate fix: emit it only when the caller can write, or demote to debug for read-only verbs.
 - [HW GATE §9.4 build half — PASS, orchestrator-run] `makepkg --nodeps` (no install; safe, no root, no /sys)
   built afanctl-0.1.0-1-x86_64.pkg.tar.zst cleanly. Contents verified: usr/bin/afanctl,
   usr/lib/systemd/system/afanctl.service, etc/afanctl/afanctl.toml with `backup = etc/afanctl/afanctl.toml`,

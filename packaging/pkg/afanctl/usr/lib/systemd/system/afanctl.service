@@ -1,0 +1,20 @@
+[Unit]
+Description=afanctl - applesmc fan supervisor (pre-T2 Intel Mac)
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/afanctl daemon --mode observe
+WatchdogSec=15
+Restart=always
+RestartSec=1
+ProtectSystem=strict
+ReadWritePaths=/sys/devices/platform/applesmc.768
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RuntimeDirectory=afanctl
+
+[Install]
+WantedBy=multi-user.target

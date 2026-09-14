@@ -453,8 +453,8 @@ From PRD §9.3/§9.4 — the only real-sysfs session in the entire project. The 
 - [x] b. `sudo afanctl doctor --roundtrip` — **PASS 2026-09-14**: manual @ 1200 rpm verified over 2 s (observed 1210 rpm / Manual during the hold), AUTO restored. Non-root it refuses to write (no L2 fd) rather than writing manual — by design.
 - [x] c. `sudo afanctl selftest-panic` — **PASS 2026-09-14**: deliberate panic at `src/safety.rs:81`, exit 101; `fan1_manual` reads `0` afterwards.
 - [ ] d. `systemctl start afanctl` (observe) — **run §9.4's `makepkg -si` first: `d` needs the installed unit** (the unit-health WARN clears then). Journal shows READY + watchdog armed; 30-min soak, zero errors; `status` reflects the state file.
-- [ ] e. `SIGKILL` the daemon in curve mode → restarts within ~1 s → L2 already restored AUTO → daemon resumes; verify via `status` + journal.
-- [ ] f. (user-gated) `afanctl curve` + 1-hour soak; then `doctor --compare 600` for the empirical record.
+- [ ] e. `SIGKILL` the daemon in curve mode → it restarts within ~1 s and the **startup reconcile** restores AUTO → daemon resumes. **BLOCKED until F14 lands**: pre-F14 a SIGKILL is uncatchable, so L2 cannot run and nothing restores AUTO (the fan stays manual indefinitely — the C1 class). Verify via `status` + journal + `cat /sys/devices/platform/applesmc.768/fan1_manual`.
+- [ ] f. (user-gated) `afanctl curve` + 1-hour soak; then `doctor --compare 600` for the empirical record. **Hold until F14 lands** for the same reason as (e): any uncatchable death during a curve soak would strand the fan in manual.
 - [ ] g. `afanctl hold 3000` via the polkit rule from a user shell — fan ~3000, `doctor` warns hold active; overshoot guard verified by `once --at-temp` simulation.
 - [ ] `makepkg -si` builds and installs cleanly; `systemctl enable` survives a reboot test (boots in observe, fan on the SMC curve).
 

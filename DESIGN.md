@@ -134,6 +134,15 @@ impl Supervisor {
     /// L1 re-assert → write state.json → watchdog ping. Returns the report (testable).
     pub fn step_once(&mut self) -> StepReport;
     /// Foreground loop (systemd Type=notify). Installs L2, notifies READY, runs forever.
+    /// RULING F14 (orchestrator, 2026-09-14): startup order is now
+    /// arm L2 → **reconcile stale state** → sd_status/sd_ready → poll loop.
+    /// Reconcile: read the fan; if `Manual`, restore AUTO on the verified write path and log
+    /// loudly; if that restore fails (or the fan cannot be read while a writing mode is
+    /// commanded), degrade to `RunMode::Observe` + `monitor_only` — never command manual
+    /// mode while AUTO cannot be restored. Idempotent: no write when the fan already reads
+    /// `Auto`. Rationale: a SIGKILL/OOM-kill cannot run L2, so the *restart* is what restores
+    /// AUTO within ~1 s; PRD §9.3e's "L2 already restored AUTO" names a mechanism that is
+    /// impossible for an uncatchable signal, while its property remains the acceptance bar.
     pub fn run(&mut self) -> !;
 }
 pub struct RuntimePaths { pub cmd: std::path::PathBuf, pub state: std::path::PathBuf }

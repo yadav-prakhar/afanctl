@@ -1,0 +1,19 @@
+# afanctl configuration — installed to /etc/afanctl/afanctl.toml
+#
+# Installed from packaging/afanctl.toml.default. pacman `backup=` preserves
+# your edits across upgrades. The daemon refuses to start on an invalid or
+# incomplete file; a *missing* file falls back to the built-in defaults below.
+#
+# Exactly five keys are honoured. Any other key is reported as an unknown-key
+# warning and ignored.
+
+[thresholds]          # °C, integers
+high = 66             # ramp starts here; low is derived: high - 3
+max  = 86             # full speed from here; guard: max <= 95 (Tjmax 100 - 5)
+
+[curve]
+min_rpm = 1200        # clamped to >= fan1_min at load
+max_rpm = 6200        # clamped to <= fan1_max at load
+
+[poll]
+interval_s = 1        # >= 1
