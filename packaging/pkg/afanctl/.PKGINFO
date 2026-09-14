@@ -6,9 +6,9 @@ xdata = pkgtype=pkg
 pkgver = 0.1.0-1
 pkgdesc = applesmc fan supervisor for pre-T2 Intel Macs (A1708)
 url = https://example.invalid/afanctl
-builddate = 1789397502
+builddate = 1789398001
 packager = Unknown Packager
-size = 1010786
+size = 1012050
 arch = x86_64
 license = MIT
 backup = etc/afanctl/afanctl.toml

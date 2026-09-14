@@ -151,6 +151,18 @@
   merges (same files: smc.rs/supervisor.rs/cli.rs). RULING F18 freezes: additive `monitor_only` field in
   state.v1 + status.v1 (no id bump), human status gains mode/target/errors, smc pre-open WARN → debug,
   `RuntimePaths.config_source` approved.
+- [F18 — MERGED] branch `fix/observability` (88477a3) merged; gates green on merged tree (136 tests,
+  fmt/clippy clean, `--features hw` guard skips). Scope-verified by orchestrator: DESIGN.md touched only
+  for the approved A4 field + the additive `monitor_only` in both Appendix-B examples; cli.rs hunks are
+  the status surface plus threading `globals.config` into `build_supervisor_with` (A4); the remaining
+  cli.rs edits are in-file tests. Tests added: healthy daemon reports `monitor_only: false`; **induced
+  degradation** (`fan1_output` chmod 0444 → curve writes fail → state/status mark monitor-only — the
+  F17b regression test); human status renders mode/target/errors; schema tests cover both ids with the
+  new field. README updated to match observed output (docs-vs-behavior). Product-code delta **+79 LOC**
+  (budget +150). Package rebuilt 20:30.
+- [PLAN CHANGE — orchestrator] T9b review dispatched: adversarial review of everything merged *after*
+  the T9 gate (F14/F16/F18 + the four rulings), because the hardware gate found a class T9 could not see
+  (fixture-shaped physics assumptions). Read-only, fresh context, no hardware tests.
 - [F16 — MERGED] branch `fix/write-verify` (37722cf) merged; gates green on merged tree (131 tests,
   fmt/clippy clean, `--features hw` guard skips). Verified by orchestrator in source: `SysfsSmc::write_speed`
   now reads back **`fan1_output`** against `WRITE_ECHO_TOLERANCE_RPM`; `l1_poll` splits mode-drift
