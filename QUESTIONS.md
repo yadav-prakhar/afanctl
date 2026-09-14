@@ -260,3 +260,12 @@ parses/clamps the rpm. If Q8 is meant literally (no flags at all), drop the
 executed by the test gates.
 
 
+
+## FX-A — T9 fix ticket A
+
+### N-FX-A-1 (non-blocking): README `once` row vs file ownership
+
+T9fixA's defect list asks for a README once-row update (F1 doc half), but its
+RULES assign README to Ticket B. Resolved per the cross-agent protocol: the
+code + tests implement the restore; the README wording change is recorded in
+DEVIATIONS.md `## FX-A` (N-FX-A-1) for Ticket B. No answer needed to proceed.

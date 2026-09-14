@@ -25,12 +25,9 @@ use crate::config::{Config, ResolvedConfig};
 use crate::policy::{Controller, Decision, MilliC};
 use crate::smc::{FanMode, SensorReading, Smc, SysfsSmc};
 
-/// Sysfs mount checked by the CLI path. Mirrors `cli::DEFAULT_SYSFS_ROOT`;
-/// `doctor::run` has no channel to receive the parsed `--sysfs-root` global
-/// (see Q-T7-1), so the default is the only value reachable here.
-const DEFAULT_SYSFS_ROOT: &str = "/sys";
-/// Config path checked by the CLI path (R6); the global `--config` cannot
-/// reach `doctor::run` either (Q-T7-1) — see `run_at` for the test seam.
+/// Module-default config path used when `run` receives `config_path = None`
+/// (R6). The sysfs root has no default here: the caller (cli's parsed
+/// `--sysfs-root` global) always supplies it (ruling D-T9-F2).
 const DEFAULT_CONFIG: &str = "/etc/afanctl/afanctl.toml";
 /// Tjmax for coretemp on this platform (PRD §2.1): plausibility ceiling.
 const TJMAX_C: i32 = 100;
@@ -124,20 +121,24 @@ struct CompareReport {
     verdict: String,
 }
 
-/// Run the doctor suite against the default sysfs root/config; exit 1 on FAIL.
-pub fn run(roundtrip: bool, compare_secs: Option<u64>, json: bool) -> i32 {
-    run_at(
-        Path::new(DEFAULT_SYSFS_ROOT),
-        Path::new(DEFAULT_CONFIG),
-        roundtrip,
-        compare_secs,
-        json,
-    )
+/// Run the doctor suite (Appendix A, amended by ruling D-T9-F2): the CLI
+/// globals are explicit parameters — `sysfs_root` redirects all sysfs access
+/// (R5), `config_path = None` falls back to the module-default config path
+/// (R6). Exit 1 if any check FAILs.
+pub fn run(
+    sysfs_root: &Path,
+    config_path: Option<&Path>,
+    roundtrip: bool,
+    compare_secs: Option<u64>,
+    json: bool,
+) -> i32 {
+    let config_path = config_path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG));
+    run_at(sysfs_root, config_path, roundtrip, compare_secs, json)
 }
 
-/// Implementation seam: same behavior as [`run`] but rooted at explicit paths
-/// so fixture trees and temp configs can be exercised from unit tests. Private
-/// — Appendix A freezes `run` and no public item may be added (D-protocol).
+/// Implementation seam: resolves `config_path` already, so unit tests can
+/// drive fixture trees and temp configs directly. Private — Appendix A
+/// freezes `run` and no public item may be added (D-protocol).
 fn run_at(
     root: &Path,
     config_path: &Path,

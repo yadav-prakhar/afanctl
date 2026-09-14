@@ -228,12 +228,24 @@ fn parse_verb(verb: &str, tail: &[&str]) -> Result<Command, CliError> {
 }
 
 /// Consume the value following a flag, advancing the cursor past it.
+/// A following token starting with `-` is a missing value — it is almost
+/// certainly the next flag (F12: `--config --json` must not silently bind
+/// `--json` as a path) — except a negative *number*, which only `--at-temp`
+/// accepts (locked by the `--at-temp -5` parse test).
 fn value<S: AsRef<str>>(args: &[S], at: &mut usize, flag: &str) -> Result<String, CliError> {
     let next = args
         .get(*at + 1)
         .ok_or_else(|| bad(format!("{flag} needs a value")))?;
+    let text = next.as_ref();
+    let negative_number =
+        text.len() > 1 && text.starts_with('-') && text[1..].chars().all(|c| c.is_ascii_digit());
+    if text.starts_with('-') && !(flag == "--at-temp" && negative_number) {
+        return Err(bad(format!(
+            "{flag} needs a value, got flag-like `{text}` (fix: pass the value directly after {flag})"
+        )));
+    }
     *at += 1;
-    Ok(next.as_ref().to_string())
+    Ok(text.to_string())
 }
 
 /// Reject any trailing argument (verbs that take none).
@@ -302,7 +314,7 @@ fn dispatch(command: Command, globals: &Globals) -> i32 {
             json,
             roundtrip,
             compare_secs,
-        } => run_doctor(json, roundtrip, compare_secs),
+        } => run_doctor(json, roundtrip, compare_secs, globals),
         Command::Once {
             at_temp,
             dry_run,
@@ -418,24 +430,69 @@ fn run_once(at_temp: Option<i32>, dry_run: bool, json: bool, globals: &Globals) 
 
 /// Live one-shot: a real `Supervisor::step_once` over the sysfs backend, or
 /// (with `--at-temp`) over a `MockSmc` whose band is the configured curve band.
+///
+/// INVARIANT (F1): on the live path the verb arms L2 before any control write
+/// and restores AUTO through the verify path on EVERY exit path — success,
+/// verify failure, or error — so `once` can never leave the fan in manual
+/// (the C1 end-state); a mid-verb crash is caught by the armed death path.
 fn step_once_report(
     at_temp: Option<i32>,
     config: &Config,
     globals: &Globals,
 ) -> Result<StepReport, CliError> {
-    let mut supervisor = match at_temp {
+    match at_temp {
         Some(c) => {
             let mut mock = MockSmc::new(config.min_rpm, config.max_rpm);
             mock.set_sensors(vec![simulated_reading(c)]);
-            build_supervisor_with(Box::new(mock), config, RunMode::Curve)?
+            let mut supervisor = build_supervisor_with(Box::new(mock), config, RunMode::Curve)?;
+            Ok(supervisor.step_once())
         }
-        None => {
-            let smc = SysfsSmc::open(&globals.sysfs_root)
-                .map_err(|e| CliError::Runtime(e.to_string()))?;
-            build_supervisor_with(Box::new(smc), config, RunMode::Curve)?
+        None => live_once_report(config, globals),
+    }
+}
+
+/// The live (sysfs) half of `once`: open the backend, arm L2, run exactly one
+/// poll, then restore AUTO before returning — whatever the poll's outcome.
+fn live_once_report(config: &Config, globals: &Globals) -> Result<StepReport, CliError> {
+    let smc = SysfsSmc::open(&globals.sysfs_root).map_err(|e| CliError::Runtime(e.to_string()))?;
+    // INVARIANT: L2 armed before any control write can happen, so a crash
+    // between enter_manual and exit still writes AUTO (single `write(b"0")`).
+    if let Some(fd) = smc.panic_fd() {
+        crate::safety::install_death_path(fd);
+    }
+    let step = build_supervisor_with(Box::new(smc), config, RunMode::Curve)
+        .map(|mut supervisor| supervisor.step_once());
+    match step {
+        Ok(mut report) => {
+            restore_auto_on_exit(&globals.sysfs_root)?;
+            report
+                .notes
+                .push("exit: AUTO restored (fan1_manual=0)".to_string());
+            Ok(report)
         }
-    };
-    Ok(supervisor.step_once())
+        Err(e) => {
+            // Even an error path must leave the fan with the firmware; a
+            // failed restore is the more urgent failure and is surfaced.
+            restore_auto_on_exit(&globals.sysfs_root)?;
+            Err(e)
+        }
+    }
+}
+
+/// F1 exit restore: hand the fan back to the firmware through the verified
+/// write path before `once` exits. A fresh backend handle is opened because
+/// the supervisor owns its smc privately; the R1 write-verify invariant is
+/// unchanged. A failed restore is a runtime error (exit 1) naming the file
+/// and the fix — `once` must never report success with the fan left manual.
+fn restore_auto_on_exit(root: &std::path::Path) -> Result<(), CliError> {
+    let mut smc = SysfsSmc::open(root).map_err(|e| CliError::Runtime(e.to_string()))?;
+    smc.set_mode(FanMode::Auto).map_err(|e| {
+        CliError::Runtime(format!(
+            "once exit restore: set AUTO on fan1_manual failed: {e} (fix: check \
+             fan1_manual writability; the fan may remain in manual — run `afanctl doctor` as root)"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Simulated one-shot: the pure controller step only — no smc actuation, no
@@ -506,19 +563,19 @@ fn mode_token(mode: &RunMode) -> &'static str {
     }
 }
 
-/// `doctor`: T7 owns the checklist/`--compare` output (Appendix C). Per ruling on
-/// D-T6-1 (ACCEPTED), `doctor::run` takes `json` and renders Appendix C as JSON
-/// (same fields) when set. The T7 stub `unimplemented!()` panics: a panic must
-/// never escape as a raw exit 101, so it is caught here and mapped to a clear
-/// stderr line plus exit 1. T7 replaces the body; the catch stays harmless.
-fn run_doctor(json: bool, roundtrip: bool, compare_secs: Option<u64>) -> i32 {
-    match std::panic::catch_unwind(|| crate::doctor::run(roundtrip, compare_secs, json)) {
-        Ok(code) => code,
-        Err(_) => {
-            eprintln!("doctor: not available yet (T7 pending)");
-            1
-        }
-    }
+/// `doctor`: diagnostics against the parsed globals (ruling D-T9-F2 —
+/// `--sysfs-root`/`--config` are R5 global redirects and must be honored).
+/// Per ruling on D-T6-1 (ACCEPTED), `doctor::run` takes `json` and renders
+/// Appendix C as JSON (same fields) when set. No `catch_unwind`: the T7 stub
+/// is long gone, so a genuine panic surfaces truthfully (F8).
+fn run_doctor(json: bool, roundtrip: bool, compare_secs: Option<u64>, globals: &Globals) -> i32 {
+    crate::doctor::run(
+        &globals.sysfs_root,
+        Some(&globals.config),
+        roundtrip,
+        compare_secs,
+        json,
+    )
 }
 
 /// Hidden L2 probe (R4; supervised gate §9.3c): arm the death path against the
@@ -631,7 +688,10 @@ fn status_json(d: &StatusData) -> serde_json::Value {
     let running = d.state.is_some();
     serde_json::json!({
         "schema": "afanctl.status.v1",
-        "daemon": {"running": running, "mode": field("mode").and_then(|m| m.as_str()).unwrap_or("observe"), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).unwrap_or(0)},
+        // F7/D-T9-F7: Appendix B's `uptime_s` is approximated as
+        // pings × interval_s (the state file stores a ping count, not
+        // seconds; saturating multiply guards a pathological config).
+        "daemon": {"running": running, "mode": field("mode").and_then(|m| m.as_str()).unwrap_or("observe"), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
         "sensors": d.sensors.iter().map(|s| serde_json::json!({"label": s.label, "temp_c": s.milli_c.map_or(serde_json::Value::Null, temp)})).collect::<Vec<_>>(),
         "effective": {"temp_c": d.t_eff.map_or(serde_json::Value::Null, temp), "method": "max"},
         "fan": {"rpm": d.fan.rpm, "min_rpm": d.hw_min, "max_rpm": d.hw_max, "target_rpm": field("target_rpm").cloned().unwrap_or(serde_json::Value::Null), "manual": d.fan.mode == FanMode::Manual},
@@ -840,7 +900,16 @@ mod tests {
             vec!["doctor", "--bogus"],
             vec!["once", "--at-temp"],
             vec!["once", "--at-temp", "warm"],
+            vec!["once", "--at-temp", "--json"],
             vec!["once", "--bogus"],
+            // F12: a minus-prefixed token after a value-taking flag is a
+            // missing value, never a value (negative numbers excepted for
+            // --at-temp, proven by parses_every_verb).
+            vec!["--config", "--json"],
+            vec!["--config", "-x", "status"],
+            vec!["--sysfs-root", "--json", "status"],
+            vec!["doctor", "--compare", "--json"],
+            vec!["daemon", "--mode", "--json"],
             vec!["observe", "--json"],
             vec!["curve", "extra"],
             vec!["hold"],
@@ -1119,7 +1188,7 @@ mod tests {
         assert_eq!(value["schema"], "afanctl.status.v1");
         assert_eq!(value["daemon"]["running"], true);
         assert_eq!(value["daemon"]["mode"], "curve");
-        assert_eq!(value["daemon"]["uptime_s"], 42);
+        assert_eq!(value["daemon"]["uptime_s"], 42, "pings × interval_s (1)");
         assert_eq!(value["fan"]["rpm"], 1200, "live sysfs read");
         assert_eq!(value["fan"]["min_rpm"], 1200);
         assert_eq!(value["fan"]["max_rpm"], 7200);
@@ -1148,6 +1217,34 @@ mod tests {
         assert_eq!(value["effective"]["temp_c"], 45.0);
     }
 
+    /// F7/D-T9-F7: `uptime_s` is pings × interval_s from the config as
+    /// loaded — not the raw ping count.
+    #[test]
+    fn status_uptime_s_multiplies_pings_by_interval() {
+        let env = RuntimeEnv::new();
+        let cfg = env.dir.0.join("afanctl.toml");
+        std::fs::write(
+            &cfg,
+            "[thresholds]\nhigh = 66\nmax = 86\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = 5\n",
+        )
+        .expect("write config");
+        std::fs::write(
+            env.state(),
+            r#"{"schema":"afanctl.state.v1","mode":"curve","watchdog_pings":42,"recent_errors":[]}"#,
+        )
+        .expect("seed state.json");
+        let g = Globals {
+            config: cfg,
+            sysfs_root: fixture_root(),
+        };
+        let data = gather_status(&g).expect("gather");
+        assert_eq!(
+            status_json(&data)["daemon"]["uptime_s"],
+            210,
+            "42 pings × 5 s interval"
+        );
+    }
+
     /// Human status must render whole temps with one decimal (45.0 C, not 4 C).
     #[test]
     fn status_human_renders_full_temperatures() {
@@ -1163,11 +1260,11 @@ mod tests {
         );
     }
 
-    /// The T7 stub's panic maps to a clear exit 1, never a raw 101.
+    /// F2/D-T9-F2: the CLI forwards the parsed globals to doctor; the healthy
+    /// fixture with a missing config file (→ defaults) exits 0.
     #[test]
-    fn doctor_stub_maps_panic_to_exit_1() {
-        assert_eq!(run_doctor(false, false, None), 1);
-        assert_eq!(run_doctor(true, true, Some(1)), 1);
+    fn doctor_receives_the_parsed_globals() {
+        assert_eq!(run_doctor(false, false, None, &globals(&fixture_root())), 0);
     }
 
     #[test]

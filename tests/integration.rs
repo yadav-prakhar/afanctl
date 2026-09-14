@@ -218,7 +218,9 @@ impl Drop for Daemon {
 }
 
 /// `once`: one control iteration over the fixture copy prints the decision and
-/// actuates through the verify path (curve at 45 °C → SetSpeed(1200)).
+/// actuates through the verify path (curve at 45 °C → SetSpeed(1200)) — and
+/// restores AUTO before exiting (F1: the verb must never leave `fan1_manual`
+/// armed; the C1 end-state is impossible by normal operation).
 #[test]
 fn once_prints_decision_and_actuates_verify_path() {
     let run_dir = RunDir::new();
@@ -240,9 +242,93 @@ fn once_prints_decision_and_actuates_verify_path() {
     assert!(stdout.contains("decision=SetSpeed(1200)"), "{stdout}");
     assert!(stdout.contains("applied_rpm=1200"), "{stdout}");
     assert!(stdout.contains("verified=true"), "{stdout}");
-    // The write-verify path committed: manual armed, output written.
-    assert_eq!(fixture.read("fan1_manual"), "1");
+    // The write-verify path committed (output holds the written rpm), then
+    // the exit restore handed the fan back to the firmware (F1).
     assert_eq!(fixture.read("fan1_output"), "1200");
+    assert_eq!(
+        fixture.read("fan1_manual"),
+        "0",
+        "once must restore AUTO on a clean exit (F1)"
+    );
+    assert!(stdout.contains("exit: AUTO restored"), "{stdout}");
+}
+
+/// F1: `once` must also clear a pre-existing C1 state — a fixture left at
+/// `fan1_manual=1` by an earlier crashed process comes back as AUTO after one
+/// `once` iteration, and the restore failure path stays a nonzero exit.
+#[test]
+fn once_restores_auto_even_from_a_preexisting_manual_state() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    fixture.write("fan1_manual", "1");
+    let out = run(
+        &run_dir,
+        &[
+            "once",
+            "--config",
+            "/nonexistent/afanctl/afanctl.toml",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(out.status.success(), "once must exit 0: {}", stderr(&out));
+    assert_eq!(
+        fixture.read("fan1_manual"),
+        "0",
+        "the C1 end-state must not survive a `once`"
+    );
+}
+
+/// F2/D-T9-F2: `doctor` honors the `--sysfs-root` and `--config` globals —
+/// it must report the FIXTURE's 45.0 C (never the live machine's temps), and
+/// a present-but-invalid config is a FAIL naming the key (exit 1).
+#[test]
+fn doctor_honors_sysfs_root_and_config_globals() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::new();
+    let root = fixture.root.to_str().expect("utf8 root");
+
+    let ok = run(
+        &run_dir,
+        &[
+            "doctor",
+            "--sysfs-root",
+            root,
+            "--config",
+            "/nonexistent/afanctl/afanctl.toml",
+        ],
+    );
+    assert!(
+        ok.status.success(),
+        "healthy fixture must pass: {}",
+        stderr(&ok)
+    );
+    let stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        stdout.contains("45.0"),
+        "fixture t_eff expected (not the live machine): {stdout}"
+    );
+
+    let bad = run_dir.dir.join("bad.toml");
+    std::fs::write(
+        &bad,
+        "[thresholds]\nhigh = 90\nmax = 80\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = 1\n",
+    )
+    .expect("write bad config");
+    let out = run(
+        &run_dir,
+        &[
+            "doctor",
+            "--sysfs-root",
+            root,
+            "--config",
+            bad.to_str().expect("utf8 bad.toml"),
+        ],
+    );
+    assert!(!out.status.success(), "a bad config must FAIL doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("config validation"), "{stdout}");
+    assert!(stdout.contains("thresholds.high"), "key named: {stdout}");
 }
 
 /// `hold` writes `cmd.json` only (never sysfs); a spawned `daemon` then applies
