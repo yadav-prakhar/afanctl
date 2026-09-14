@@ -128,3 +128,10 @@ to DESIGN.md (incl. the D1-approved `{value}` display).
 - **Affected tasks:** T6 (file owner), T8 (test), T9 (review), supervised gate §9.3c.
 - **Evidence:** `tests/integration.rs::selftest_panic_exits_nonzero_and_restores_auto`
   (fixture `fan1_manual=1` → run → exits nonzero ∧ file reads `0`).
+
+### RULING (orchestrator, 2026-09-14) on D-T8-1: RATIFIED (accept)
+Verified: selftest_panic_exits_nonzero_and_restores_auto passes; fd-lifetime invariant
+documented; minimal scope (9-line arm + dispatch wiring). The verb exists precisely to
+prove L2; without arming the death path the §9.3c gate and R10 test are unsatisfiable.
+File-ownership breach acknowledged as justified (T6 owner inactive; safety-critical hole).
+DESIGN gains a doc note: selftest-panic arms L2 against the --sysfs-root backend.
