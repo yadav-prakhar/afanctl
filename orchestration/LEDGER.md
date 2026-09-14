@@ -11,8 +11,8 @@
 | T4 | safety+notify | glm-5.3-flash/high | t4-safety | MERGED | 1 | 0 | 0 | 5773595 |
 | T5 | supervisor | glm-5.3-flash/high | t5-supervisor | MERGED | 1 | 0 | 0 | a6bbdbd |
 | T6 | cli+main (a: parser; b: wiring) | deepseek-v4.1-flash | t6-cli | MERGED(a) | 1 | 0 | 0 | 815d0fa |
-| T7 | doctor | deepseek-v4.1-flash | t7-doctor | PENDING | 0 | 0 | 0 | — |
-| T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | PENDING | 0 | 0 | 0 | — |
+| T7 | doctor | deepseek-v4.1-flash | t7-doctor | MERGED | 2 | 0 | 1 | a71b9f4 |
+| T8 | integration+packaging | deepseek-v4.1-flash | t8-integration | MERGED | 2 | 0 | 1 | 9b6aa9d |
 | T9 | review gate | glm-5.3-flash/high | — (read-only) | PENDING | 0 | 0 | 0 | — |
 
 <!-- statuses: PENDING · DISPATCHED · VERIFYING · BOUNCED(n) · MERGED · BLOCKED · ESCALATED -->
@@ -47,3 +47,9 @@
   the repo fixture path, with any verb that actuates.
 - [T6b MERGED] c0eaed4 (phase b wiring: daemon/once/hold real Supervisor, --at-temp, --dry-run,
   hold clamp-before-write, doctor stub catch → exit 1). Post-fix main gates GREEN.
+- [T7 first-dispatch died silently mid-run (4 min, no commits); re-dispatch succeeded. T8 same.
+- [D-T8-1 RATIFIED] selftest-panic arms L2 vs --sysfs-root; 9-line arm verified by failing→passing test.
+- [T7 verified] 98 tests green; doctor card complete. [T8 verified] integration tests spawn real binary
+  (tempdir fixtures, AFANCTL_RUNTIME_DIR), selftest-panic restores AUTO, packaging matches Appendix D.
+- [A2 PASS] audits re-run: unsafe confined; /sys confined; deps allowlist exact; product-code
+  unwrap=0 (rechecked); .omo noise untracked+ignored via T8 chore commit.
