@@ -75,3 +75,9 @@
 - [FINAL GATE SWEEP] hold-integration test used interval_s=30 (pre-F3) → dead after F3 cap; retuned to 10 s
   (still one long poll, now legal). ALL FOUR GATES GREEN on main at 8c6d2fd.
 - [STATUS] Build complete. §9.3/§9.4 supervised hardware gate handed to user (Appendix P5, PLAN.md).
+- [HW GATE (a) attempt 1 — 2026-09-14 13:48] user ran `afanctl doctor` as non-root: dispatcher WARN
+  "cannot pre-open fan1_manual O_WRONLY; L2 death path unavailable (os error 13)" + 2 FAIL
+  ("fan files present & writable", "L2 fd armed") + expected WARN (unit not installed). Adjudication:
+  NOT a defect — matches README "Root required (F11)"; both FAILs are the same permission cause, exit 1
+  by design. PLAN.md P5 item (a) amended to say run elevated (orchestrator-owned doc). Re-run elevated;
+  no code ticket opened. All other checks PASS (3 sensors, t_eff 54.0 C, fan 1200..7200, config defaults valid).

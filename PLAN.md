@@ -449,7 +449,7 @@ and anything you deliberately left for a later task.
 
 From PRD §9.3/§9.4 — the only real-sysfs session in the entire project. The orchestrator never runs these; it hands them over:
 
-- [ ] a. `afanctl doctor` — all PASS, read-only.
+- [ ] a. `sudo afanctl doctor` — all PASS, read-only. Do **not** run it as a plain user: the write-mode checks (`fan1_manual` writable, L2 fd armed) open the manual file `O_WRONLY`, so they FAIL by design without root (README "Root required (F11)"). `WARN` lines never block; the `systemd unit health — unit not installed` WARN is expected until `makepkg -si` in §9.4.
 - [ ] b. `afanctl doctor --roundtrip` — manual 2 s → AUTO restore verified.
 - [ ] c. `sudo afanctl selftest-panic` — process dies; `fan1_manual` reads 0; `doctor` confirms AUTO.
 - [ ] d. `systemctl start afanctl` (observe) — journal shows READY + watchdog armed; 30-min soak, zero errors; `status` reflects the state file.
