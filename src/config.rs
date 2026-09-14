@@ -2,8 +2,10 @@
 //! `[thresholds]`, `[curve]`, `[poll]`; strict validation; unknown-key
 //! warnings (not errors); provenance (default vs file).
 //!
-//! Invariants: `from_toml` rejects `high >= max`, `max > 95`,
-//! `min_rpm >= max_rpm`, `interval_s < 1`, and non-integer or missing keys —
+//! Invariants: `from_toml` rejects thresholds outside the 0..=95 °C band,
+//! `high >= max`, `min_rpm >= max_rpm`, `interval_s < 1` or
+//! `interval_s > MAX_INTERVAL_S` (the unit's `WatchdogSec=15` minus a 1 s
+//! margin, T9-F3), and non-integer or missing keys —
 //! always naming the key and the fix (kills H3 and mbpfan's missing≡0 trap).
 //! `load` maps a *missing* file to `defaults()`; a present-but-invalid file is
 //! refused. `validate(hw)` clamps rpms to the hardware band `(fan1_min,
@@ -26,6 +28,18 @@ const KNOWN: &[(&str, &[&str])] = &[
     ("poll", &["interval_s"]),
 ];
 
+/// The watchdog budget pinned by the systemd unit (`packaging/afanctl.service`
+/// `WatchdogSec=15`). Compiled-in coupling to that file (T9-F3): the
+/// supervisor sends exactly one `WATCHDOG=1` per poll, so a poll period at or
+/// above this budget starves the watchdog → SIGABRT → L2 → `Restart=always`
+/// crash-loop.
+pub const WATCHDOG_UNIT_SEC: u64 = 15;
+
+/// Largest legal `poll.interval_s`: the unit's watchdog budget
+/// ([`WATCHDOG_UNIT_SEC`]) minus a 1 s scheduling margin. `Config` rejects
+/// anything above this.
+pub const MAX_INTERVAL_S: u64 = WATCHDOG_UNIT_SEC - 1;
+
 /// Typed config: the five user-tunable values (PRD R6). Safety tunables are
 /// named constants in `policy.rs`/`supervisor.rs`, never config.
 #[derive(Debug, Clone)]
@@ -38,7 +52,7 @@ pub struct Config {
     pub min_rpm: u32,
     /// Curve ceiling (rpm); clamped down to hardware `fan1_max` at load.
     pub max_rpm: u32,
-    /// Poll period (s); `>= 1`.
+    /// Poll period (s); `1..=MAX_INTERVAL_S` (watchdog coupling, T9-F3).
     pub interval_s: u64,
 }
 
@@ -106,8 +120,9 @@ impl Config {
     }
 
     /// Validate against hardware range `hw = (fan1_min, fan1_max)`: rejects
-    /// `high >= max`, `max > 95`, `min_rpm >= max_rpm`, `interval_s < 1`, and
-    /// a band that empties once `min_rpm` is clamped up to `fan1_min` and
+    /// thresholds outside the 0..=95 °C band, `high >= max`,
+    /// `min_rpm >= max_rpm`, `interval_s < 1` or `interval_s > MAX_INTERVAL_S`,
+    /// and a band that empties once `min_rpm` is clamped up to `fan1_min` and
     /// `max_rpm` down to `fan1_max` (the load-time clamping rule, PRD R6).
     pub fn validate(&self, hw: (u32, u32)) -> Result<(), ConfigError> {
         self.check_structural()?;
@@ -141,14 +156,31 @@ impl Config {
 
     /// The hw-independent invariants shared by `from_toml` and `validate`.
     fn check_structural(&self) -> Result<(), ConfigError> {
-        if self.max_c > 95 {
+        if !(0..=95).contains(&self.max_c) {
             return Err(ConfigError::Invalid {
                 key: K_MAX,
+                reason: if self.max_c > 95 {
+                    format!(
+                        "max ({}) exceeds the 95 °C guard (Tjmax 100 - 5)",
+                        self.max_c
+                    )
+                } else {
+                    format!(
+                        "max ({}) is below 0 °C — a threshold no real temperature can reach",
+                        self.max_c
+                    )
+                },
+                fix: "set `max` within the 0..=95 °C band".to_string(),
+            });
+        }
+        if !(0..=95).contains(&self.high_c) {
+            return Err(ConfigError::Invalid {
+                key: K_HIGH,
                 reason: format!(
-                    "max ({}) exceeds the 95 °C guard (Tjmax 100 - 5)",
-                    self.max_c
+                    "high ({}) is outside the 0..=95 °C band — a fan controller's thresholds that can't reproduce a real temperature are a config error",
+                    self.high_c
                 ),
-                fix: "set `max` to 95 or lower".to_string(),
+                fix: "set `high` within 0..=95 °C (and below `max`)".to_string(),
             });
         }
         if self.high_c >= self.max_c {
@@ -176,6 +208,9 @@ impl Config {
         }
         if self.interval_s == 0 {
             return Err(interval_below_one(0));
+        }
+        if self.interval_s > MAX_INTERVAL_S {
+            return Err(interval_starves_watchdog(self.interval_s));
         }
         Ok(())
     }
@@ -296,8 +331,28 @@ fn interval_below_one(v: i64) -> ConfigError {
     }
 }
 
+/// T9-F3: all watchdog pings ride the poll cadence, so a poll period at or
+/// above the unit's `WatchdogSec` budget starves every ping — SIGABRT → L2 →
+/// `Restart=always` crash-loop. State this coupling in the rejection.
+fn interval_starves_watchdog(v: u64) -> ConfigError {
+    ConfigError::Invalid {
+        key: K_INTERVAL,
+        reason: format!(
+            "interval_s ({v}) would starve the systemd watchdog (the unit pins \
+             WatchdogSec={WATCHDOG_UNIT_SEC} s and the supervisor pings exactly \
+             once per poll), crash-looping the daemon (SIGABRT → L2 → Restart=always)"
+        ),
+        fix: format!(
+            "set `interval_s` to at most {MAX_INTERVAL_S} s (the unit's \
+             {WATCHDOG_UNIT_SEC} s watchdog budget minus a 1 s margin)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
+
     use super::*;
 
     /// The shipped install-time default, embedded so it is tested by the gate.
@@ -430,6 +485,54 @@ mod tests {
             assert_invalid(&e, K_INTERVAL);
             assert!(e.to_string().contains(">= 1"), "got `{e}`");
         }
+    }
+
+    /// T9-F3: `interval_s` must stay below the unit's `WatchdogSec=15` budget
+    /// (one ping per poll), else the daemon crash-loops. 14 s is legal.
+    #[test]
+    fn rejects_interval_starving_the_watchdog_budget_f3() {
+        for v in ["15", "20"] {
+            let e = err(&toml_with("66", "86", "1200", "6200", v));
+            assert_invalid(&e, K_INTERVAL);
+            let msg = e.to_string();
+            assert!(msg.contains("WatchdogSec=15"), "got `{msg}`");
+            assert!(
+                msg.contains("at most 14 s"),
+                "fix must name the bound, got `{msg}`"
+            );
+        }
+        let (parsed, warnings) =
+            Config::from_toml(&toml_with("66", "86", "1200", "6200", "14")).expect("14 s is legal");
+        assert_eq!(parsed.interval_s, 14);
+        assert!(warnings.is_empty());
+        assert!(parsed.validate(HW).is_ok());
+    }
+
+    /// T9-F5 layer 1: thresholds outside the 0..=95 °C band are a config
+    /// error, both keys, both directions.
+    #[test]
+    fn rejects_thresholds_outside_the_c_band_f5() {
+        assert_invalid(&err(&toml_with("-1", "86", "1200", "6200", "1")), K_HIGH);
+        assert_invalid(&err(&toml_with("66", "-1", "1200", "6200", "1")), K_MAX);
+        assert_invalid(&err(&toml_with("66", "96", "1200", "6200", "1")), K_MAX);
+    }
+
+    /// T9-F5 exact repro (previously panicked in `policy.rs` at the first hot
+    /// poll): the config API must now refuse it with key + fix, never run it.
+    #[test]
+    fn f5_repro_config_is_refused_not_run() {
+        let e = err(&toml_with(
+            "-2000000000",
+            "-1999999999",
+            "1200",
+            "6200",
+            "1",
+        ));
+        assert_invalid(&e, K_MAX);
+        assert!(e.to_string().contains("fix:"));
+        // The validate path refuses it identically.
+        let c = cfg(-2_000_000_000, -1_999_999_999, 1200, 6200, 1);
+        assert_invalid(&c.validate(HW).expect_err("band floor enforced"), K_MAX);
     }
 
     #[test]

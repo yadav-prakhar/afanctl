@@ -259,6 +259,30 @@ parses/clamps the rpm. If Q8 is meant literally (no flags at all), drop the
 `--json` arm (one line). The rule is data: `makepkg` installs it; it is not
 executed by the test gates.
 
+---
+
+## T9F-B — defect tickets (branch `t9fix-b`)
+
+### Q-T9F-B-1 (coordination — requires a one-line change in Ticket A's file): F3 validation breaks `tests/integration.rs::hold_cmd_is_applied_by_daemon_within_one_poll`
+
+B implemented F3 exactly as carded: `Config` now rejects `poll.interval_s >
+MAX_INTERVAL_S` (14; the unit's `WatchdogSec=15` minus a 1 s margin).
+`tests/integration.rs` is READ-ONLY for B (Ticket A owns the file), but its
+daemon-launch config (around tests/integration.rs:288 area) uses
+`interval_s = 30` — now legally refused at startup by the new validation, so
+the daemon never runs and the test fails with the intended key+fix message:
+
+    afanctl: invalid poll.interval_s: interval_s (30) would starve the systemd
+    watchdog … (fix: set `interval_s` to at most 14 s …)
+
+Required change (Ticket A, one line): drop the integration daemon's
+`interval_s` to a legal value ≤ 14 (suggest `1` — the first poll is
+immediate, so "applied within one poll" semantics are unaffected). This is
+not a defect in F3 — 30 s *is* the crash-loop configuration the card orders
+us to refuse. Flagging per §8 (cross-agent protocol; B must not touch A's
+files). Until A's line lands, gate 3 on `t9fix-b` is 102 unit + 3/4
+integration green with this one coordinated-red test.
+
 
 
 ## FX-A — T9 fix ticket A

@@ -6,6 +6,18 @@ rust-version = "1.98"
 description = "applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
 license = "MIT"
 
+# DESIGN §8 (T9-F4): unwrap/expect/panic are denied by every `-D warnings`
+# gate (check.sh gates 2 and 2b). Scoped allowlists live ONLY inside
+# `#[cfg(test)]` modules (plus safety.rs's sanctioned `arm_test_panic`) —
+# never in product code.
+[lints.rust]
+# intentionally empty: the §8 bans are clippy tool lints (below)
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

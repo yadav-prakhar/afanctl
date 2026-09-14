@@ -83,6 +83,8 @@ pub fn arm_test_panic() -> ! {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
+
     use super::*;
     use std::fs::{self, OpenOptions};
     use std::os::fd::AsRawFd;

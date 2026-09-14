@@ -191,8 +191,10 @@ impl Controller {
     /// Track the overshoot streak: consecutive polls with `t_eff >= max - 1`.
     fn overshoot_check(&mut self, t: MilliC) {
         // max - 1 °C, in milli-°C.
-        // INVARIANT: guard threshold = max_c - 1, per PRD R2.
-        if t.0 >= (self.max_c - 1) * 1000 {
+        // INVARIANT: guard threshold = max_c - 1, per PRD R2. Saturating
+        // math (T9-F5): a config bug must degrade, never overflow — the
+        // saturation direction makes a hot reading trip the guard.
+        if t.0 >= self.max_c.saturating_sub(1).saturating_mul(1000) {
             self.overshoot_streak += 1;
         } else {
             self.overshoot_streak = 0;
@@ -201,13 +203,16 @@ impl Controller {
 
     /// Absolute target curve (R2), recomputed every call, no direction gates.
     fn target_for(&mut self, t: MilliC) -> u32 {
-        if t.0 < self.low_c * 1000 {
+        // INVARIANT (T9-F5): threshold conversions use saturating math so a
+        // future config bug degrades loudly at the write layer, never to
+        // arithmetic overflow (debug panic / release wraparound).
+        if t.0 < self.low_c.saturating_mul(1000) {
             self.ramping = false;
             self.min_rpm
-        } else if t.0 >= self.max_c * 1000 {
+        } else if t.0 >= self.max_c.saturating_mul(1000) {
             self.ramping = true;
             self.max_rpm
-        } else if t.0 >= self.high_c * 1000 {
+        } else if t.0 >= self.high_c.saturating_mul(1000) {
             self.ramping = true;
             linear_target(t, self.high_c, self.max_c, self.min_rpm, self.max_rpm)
         } else {
@@ -249,6 +254,8 @@ fn linear_target(t: MilliC, high_c: i32, max_c: i32, min_rpm: u32, max_rpm: u32)
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
+
     use super::*;
 
     const MIN: u32 = 1200;
@@ -303,6 +310,31 @@ mod tests {
         assert_eq!(MilliC(80_400).as_c(), 80);
         assert_eq!(MilliC(80_500).as_c(), 81);
         assert_eq!(MilliC(-1_500).as_c(), -2);
+    }
+
+    /// T9-F5 layer 2 regression: even an *unvalidated* config (a future
+    /// config bug that bypasses the band check) must degrade via saturating
+    /// math, never overflow-panic in the poll loop. Saturation puts the
+    /// absurd thresholds in the max zone → the fan goes to max (cooling).
+    #[test]
+    fn absurd_unvalidated_thresholds_cannot_overflow_f5() {
+        let resolved = crate::config::ResolvedConfig {
+            config: crate::config::Config {
+                high_c: -2_000_000_000,
+                max_c: -1_999_999_999,
+                min_rpm: MIN,
+                max_rpm: MAX,
+                interval_s: 1,
+            },
+            low_c: -2_000_000_003, // direct construction: bypasses the band check on purpose
+        };
+        let mut c = Controller::new(&resolved);
+        let hot = read(MilliC::from_c(80).0);
+        // Target saturates into the max zone; slew caps the first step.
+        assert_eq!(
+            c.step_curve(std::slice::from_ref(&hot)),
+            Decision::SetSpeed(1950)
+        );
     }
 
     /// Interim sensor loss writes nothing new (Observe); the streak then
