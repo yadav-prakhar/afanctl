@@ -1,0 +1,35 @@
+# Maintainer: afanctl maintainers
+# PKGBUILD for afanctl (PRD R9). `makepkg` builds the package from this
+# checkout; `makepkg -si` (install) is user-gated (§9.4). The unit is
+# installed disabled — nothing changes until the user enables it, and the
+# daemon starts in observe mode regardless (R9).
+pkgname=afanctl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
+arch=('x86_64')
+url="https://example.invalid/afanctl"
+license=('MIT')
+depends=()
+makedepends=('rust')
+# pacman preserves user edits across upgrades (R6/H5).
+backup=('etc/afanctl/afanctl.toml')
+source=()
+sha256sums=()
+
+build() {
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked --manifest-path "$startdir/../Cargo.toml"
+}
+
+package() {
+    install -Dm755 "$srcdir/target/release/afanctl" "$pkgdir/usr/bin/afanctl"
+    install -Dm644 "$startdir/afanctl.service" \
+        "$pkgdir/usr/lib/systemd/system/afanctl.service"
+    install -Dm644 "$startdir/afanctl.toml.default" \
+        "$pkgdir/etc/afanctl/afanctl.toml"
+    install -Dm644 "$startdir/afanctl.toml.default" \
+        "$pkgdir/usr/share/afanctl/afanctl.toml.default"
+    install -Dm644 "$startdir/49-afanctl.rules" \
+        "$pkgdir/usr/share/polkit-1/rules.d/49-afanctl.rules"
+}

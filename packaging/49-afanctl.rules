@@ -1,0 +1,46 @@
+// afanctl polkit rule (PRD R8 / Q8): passwordless pkexec for wheel users,
+// restricted to an exact verb allowlist on the installed binary.
+//
+//   allow:  afanctl status [--json] | observe | curve | hold <integer-rpm>
+//   deny:   daemon, doctor --roundtrip, any other verb/flag/argument
+//
+// Notes (from pkexec(1)): pkexec performs no argument validation, and the
+// action's `command_line` detail is the argv joined by single spaces (no
+// quoting). The rule therefore re-checks `program` (the realpath) and matches
+// the argv exactly; the CLI independently parses/clamps the rpm (defence in
+// depth). Globals such as --config/--sysfs-root are never allowed here.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.policykit.exec") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (action.lookup("program") !== "/usr/bin/afanctl") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (!subject.isInGroup("wheel") || !subject.local || !subject.active) {
+        return polkit.Result.NOT_HANDLED;
+    }
+
+    var argv = (action.lookup("command_line") || "").split(" ");
+    if (argv.length < 2 || argv[0] !== "/usr/bin/afanctl") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var verb = argv[1];
+
+    var isU32 = function (s) {
+        if (!/^[0-9]+$/.test(s)) {
+            return false;
+        }
+        return parseInt(s, 10) <= 4294967295;
+    };
+
+    if ((verb === "observe" || verb === "curve") && argv.length === 2) {
+        return polkit.Result.YES;
+    }
+    if (verb === "status" && (argv.length === 2 || (argv.length === 3 && argv[2] === "--json"))) {
+        return polkit.Result.YES;
+    }
+    if (verb === "hold" && argv.length === 3 && isU32(argv[2])) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
