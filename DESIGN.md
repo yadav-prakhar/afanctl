@@ -152,7 +152,9 @@ impl Supervisor {
     pub fn new(smc: Box<dyn Smc>, cfg: &ResolvedConfig, start: RunMode,
                paths: &RuntimePaths) -> Result<Self, SupError>;
     /// Exactly one poll iteration: read cmd file → read sensors → decide → act+verify →
-    /// L1 re-assert → write state.json → watchdog ping. Returns the report (testable).
+    /// L1 re-assert → write state.json. The watchdog is pinged at the **start and end**
+    /// of the poll (RULING F21 R2: a long poll cannot extend the ping gap beyond
+    /// `max(interval, poll_work)`). Returns the report (testable).
     pub fn step_once(&mut self) -> StepReport;
     /// Foreground loop (systemd Type=notify). Installs L2, notifies READY, runs forever.
     /// RULING F14 (orchestrator, 2026-09-14): startup order is now
