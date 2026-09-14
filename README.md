@@ -14,10 +14,17 @@ gets out of the way and lets the SMC firmware run the fan again.
 afanctl is built around the principle *fail toward the firmware*:
 
 - **L1 — per-poll verify/re-assert.** Every poll re-reads `fan1_manual` and
-  `fan1_input`. If the mode drifted, or the actual rpm differs from the last
-  verified write by more than 150 rpm, the supervisor re-asserts it. After 3
-  consecutive failed re-assertions it restores AUTO and degrades to
-  monitor-only, logging loudly.
+  `fan1_input`. A tracking deviation (the fan more than 150 rpm from the last
+  verified write) is re-asserted and **never counted** — a fan still moving
+  toward its command is not a broken fan. Only mode-drift re-assert failures,
+  write-syscall errors and echo (write-verification) failures feed the
+  3-strike ladder to AUTO + monitor-only. A fan whose tach never moves toward
+  its command is caught by a separate stall detector, keyed on **tach
+  movement between polls** — a changing command (curve slew, mid-band
+  oscillation) never resets the window — and degrades directly to AUTO +
+  monitor-only after 10 motionless, off-target polls. A fan hovering just
+  outside the tolerance band is made visible by a warning after 30
+  off-target polls (no degradation).
 - **L2 — death path.** At startup the daemon pre-opens an `O_WRONLY` fd on
   `fan1_manual`. A panic hook plus raw `SIGSEGV`/`SIGABRT`/`SIGTERM`/`SIGINT`
   handlers perform exactly one async-signal-safe `write(fd, b"0")` — restoring
@@ -29,6 +36,16 @@ afanctl is built around the principle *fail toward the firmware*:
   applesmc platform dir, `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`).
 - **Sensor loss → AUTO.** Three consecutive polls with no valid temperature and
   the supervisor returns the fan to the firmware.
+- **Startup reconcile is unconditional.** At (re)start the daemon restores AUTO
+  out of *any* Manual owner it finds, including a live foreign program such as
+  mbpfan — deliberate (RULING F14): one fan supervisor owns the fan; the
+  firmware is always the fallback.
+- **Failed AUTO restore is never silent.** If a fallback's own AUTO restore
+  fails, the daemon stays in charge and re-attempts `set_mode(Auto)` every
+  poll (log rate-limited to once every 10) until a verified read-back confirms
+  AUTO; the pending state is exposed as `auto_restore_pending` in
+  `state.json` and `status --json`'s `daemon` object, and truthfully never
+  reports success before that.
 - **Invalid config → refuse to start.** A present-but-broken config never
   silently falls back to defaults; every error names the key and the fix.
 

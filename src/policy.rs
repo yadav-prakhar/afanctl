@@ -54,15 +54,25 @@ pub const MODE_SETTLE_MS: u64 = 1000;
 /// RULING F19 (R3): a window-expired write is re-issued at most this many
 /// times (once), each with its own settle window; then `VerifyFailed`.
 pub const WRITE_RETRY_MAX: u32 = 1;
-/// RULING F16 (R4): consecutive unchanged-command polls beyond which an
-/// actuator whose deviation has never decreased is declared unresponsive by
-/// the supervisor's stall detector (R3). Consumed by supervisor L1.
+/// RULING F16/F20 (R4/R1): off-target polls beyond which the supervisor's
+/// stall detector declares an unresponsive actuator (R1/R3). The window is
+/// keyed on tach movement: a command change never resets it — only observed
+/// tach movement or convergence does (F20). Consumed by supervisor L1.
 pub const STALL_POLLS: u32 = 10;
 /// L1 drift tolerance: actual rpm deviating more than this from last written
 /// triggers re-assert (R4). Consumed by supervisor, declared here per PRD §7.
 pub const VERIFY_TOLERANCE_RPM: u32 = 150;
 /// Failed L1 re-assertions before fallback: restore AUTO + monitor-only (R4).
 pub const WRITE_FAIL_FALLBACK: u32 = 3;
+/// RULING F20 (R1): "the tach is not moving at all" — a per-poll tach delta
+/// at or below this epsilon counts as motionless for the stall detector.
+pub const STALL_TACH_EPSILON_RPM: u32 = 50;
+/// RULING F20 (R2): the failed-AUTO-restore retry log is rate-limited to one
+/// ERROR every this-many polls (the retry itself happens every poll).
+pub const AUTO_RETRY_LOG_POLLS: u32 = 10;
+/// RULING F20 (R4): off-target dwell after which one WARN per excursion is
+/// emitted (a fan hovering just outside tolerance must be visible).
+pub const OFF_TARGET_WARN_POLLS: u32 = 30;
 
 /// One control decision. Pure output of a `Controller` step. Every decision
 /// path produces exactly one variant — never silence (R2).

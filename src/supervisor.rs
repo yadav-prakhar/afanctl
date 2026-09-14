@@ -37,7 +37,8 @@ pub struct StepReport {
 
 use crate::config::ResolvedConfig;
 use crate::policy::{
-    Controller, Decision, MilliC, STALL_POLLS, VERIFY_TOLERANCE_RPM, WRITE_FAIL_FALLBACK,
+    Controller, Decision, MilliC, AUTO_RETRY_LOG_POLLS, OFF_TARGET_WARN_POLLS, STALL_POLLS,
+    STALL_TACH_EPSILON_RPM, VERIFY_TOLERANCE_RPM, WRITE_FAIL_FALLBACK,
 };
 use crate::smc::{FanMode, Smc};
 
@@ -71,19 +72,31 @@ pub struct Supervisor {
     monitor_only: bool,
     /// We currently own the fan (`fan1_manual` = 1, verified).
     manual_armed: bool,
+    /// RULING F20 (R2): a fallback whose own AUTO restore failed still owns
+    /// the fan; the poll loop re-attempts `set_mode(Auto)` until verified.
+    auto_restore_pending: bool,
+    /// RULING F20 (R2): total AUTO-restore attempts made (for the "after N
+    /// attempts" success note).
+    auto_restore_attempts: u32,
+    /// Rate-limit countdown for the pending-AUTO ERROR log.
+    auto_retry_log_polls: u32,
     /// INVARIANT: only ever set from a *verified* write result (R1).
     last_written: Option<u32>,
     last_actual: Option<u32>,
+    /// RULING F20 (R1): tach from the previous poll — the stall window keys
+    /// on movement between polls, not on command changes.
+    prev_actual: Option<u32>,
     /// Consecutive failed writes/re-asserts → `WRITE_FAIL_FALLBACK`.
     write_failures: u32,
-    /// RULING F16 (R3) stall window: command this window is keyed on.
-    stall_cmd: Option<u32>,
-    /// Polls since the window began (or since deviation last improved).
+    /// RULING F20 (R1) stall window: consecutive motionless, off-target polls.
     stall_polls: u32,
-    /// Deviation when the window began.
-    stall_base_dev: u32,
-    /// Smallest deviation seen in the window (convergence evidence).
-    stall_min_dev: u32,
+    /// RULING F20 (R4): current off-target excursion length and its warn latch.
+    off_target_polls: u32,
+    off_target_warned: bool,
+    /// RULING F20 (R3): set by `run()` when `panic_fd()` was absent — the
+    /// "no L2 → observe" invariant then also gates `apply_mode`'s re-arm, so
+    /// a cmd file cannot defeat the startup guard on either channel.
+    l2_absent: bool,
     cfg_max_rpm: u32,
     hw_min: u32,
     hw_max: u32,
@@ -117,6 +130,10 @@ struct StateFile<'a> {
     /// RULING F18 (A1, additive): the monitor-only/degraded latch, visible to
     /// the plugin. Additive field, schema id stays `afanctl.state.v1`.
     monitor_only: bool,
+    /// RULING F20 (R2, additive): a fallback whose AUTO restore failed — the
+    /// fan is still Manual and the daemon keeps retrying AUTO every poll.
+    /// Schema id stays `afanctl.state.v1` (F18 precedent).
+    auto_restore_pending: bool,
     watchdog_pings: u64,
     recent_errors: &'a [RecentError],
 }
@@ -152,13 +169,17 @@ impl Supervisor {
             mode: start,
             monitor_only: false,
             manual_armed: false,
+            auto_restore_pending: false,
+            auto_restore_attempts: 0,
+            auto_retry_log_polls: 0,
             last_written: None,
             last_actual: None,
+            prev_actual: None,
             write_failures: 0,
-            stall_cmd: None,
             stall_polls: 0,
-            stall_base_dev: 0,
-            stall_min_dev: 0,
+            off_target_polls: 0,
+            off_target_warned: false,
+            l2_absent: false,
             hw_min: hw.0,
             hw_max: hw.1,
             last_cmd: None,
@@ -179,6 +200,9 @@ impl Supervisor {
         let mut notes = Vec::new();
         // 1. command file: validate + apply mode (R8).
         self.apply_cmd_file(&mut notes);
+        // 1.5 RULING F20 (R2): while an AUTO restore is pending, one
+        // best-effort attempt per poll — before any control decision.
+        self.auto_restore_retry(&mut notes);
         // 2. sensors + controller step: a failed read degrades to an empty
         // set so the controller's loss streak drives fail-toward-AUTO (R4).
         let readings = match self.smc.read_sensors() {
@@ -219,7 +243,10 @@ impl Supervisor {
     /// step + sleep forever (RULING F14: L2 → reconcile → sd_status/READY →
     /// poll loop).
     pub fn run(&mut self) -> ! {
-        if self.mode != RunMode::Observe && self.smc.panic_fd().is_none() {
+        // RULING F20 (R3): record the L2 prerequisite on the supervisor itself
+        // so `apply_mode` upholds the invariant on the cmd-file channel too.
+        self.l2_absent = self.smc.panic_fd().is_none();
+        if self.mode != RunMode::Observe && self.l2_absent {
             tracing::error!(
                 "L2 death path unavailable; degrading startup mode to observe (R4: no control without a trustworthy safety net)"
             );
@@ -304,8 +331,12 @@ impl Supervisor {
         self.manual_armed = false;
         self.last_written = None;
         self.write_failures = 0;
-        self.stall_cmd = None;
         self.stall_polls = 0;
+        self.off_target_polls = 0;
+        self.off_target_warned = false;
+        self.auto_restore_pending = false;
+        self.auto_restore_attempts = 0;
+        self.auto_retry_log_polls = 0;
     }
 
     /// One startup evidence line (RULING F14 observability): effective mode,
@@ -316,14 +347,22 @@ impl Supervisor {
         // Presence check only — never a side-effecting WATCHDOG ping.
         let watchdog_notify = std::env::var_os("NOTIFY_SOCKET").is_some();
         tracing::info!(
-            mode = %mode_name(&self.mode),
-            l2_armed,
-            watchdog_notify,
-            state_file = %self.paths.state.display(),
-            config_source = %self.paths.config_source.display(),
-            hw_band = format!("{}..{} rpm", self.hw_min, self.hw_max),
-            "afanctl daemon startup"
+            "{}",
+            self.startup_evidence_message(l2_armed, watchdog_notify)
         );
+    }
+
+    /// The startup evidence line as a testable string (RULING F14/F18, T9b
+    /// finding 8): every field, including `config_source`, must survive.
+    fn startup_evidence_message(&self, l2_armed: bool, watchdog_notify: bool) -> String {
+        format!(
+            "afanctl daemon startup: mode={}, l2_armed={l2_armed}, watchdog_notify={watchdog_notify}, state_file={}, config_source={}, hw_band={}..{} rpm",
+            mode_name(&self.mode),
+            self.paths.state.display(),
+            self.paths.config_source.display(),
+            self.hw_min,
+            self.hw_max
+        )
     }
 
     // ---- step 1: command file (R8) ----
@@ -412,11 +451,25 @@ impl Supervisor {
     /// Apply a validated command: no-op if identical to the current mode;
     /// enter control (manual) or leave it (AUTO) through the verify path.
     fn apply_mode(&mut self, requested: RunMode, notes: &mut Vec<String>) {
+        // RULING F20 (R3): one "no L2 → observe" invariant, both channels —
+        // the startup guard degraded the mode, so a cmd file must not re-arm
+        // control behind its back.
+        if self.l2_absent && requested != RunMode::Observe {
+            let msg = "L2 death path unavailable (panic fd was not opened at startup); refusing to enter control from cmd.json (fix: restart with a writable fan1_manual)";
+            tracing::error!("{msg}");
+            self.note_recent(msg.to_owned());
+            notes.push("cmd refused: no L2".into());
+            return;
+        }
         if self.monitor_only && requested != RunMode::Observe {
             // A deliberate re-command re-arms control (plugin retry story).
             tracing::info!("re-commanded after monitor-only degradation; re-arming control");
             self.monitor_only = false;
             self.write_failures = 0;
+            // Owning the fan again supersedes the pending AUTO release (F20 R2).
+            self.auto_restore_pending = false;
+            self.auto_restore_attempts = 0;
+            self.auto_retry_log_polls = 0;
         }
         if requested == self.mode {
             return; // INVARIANT: never re-issue an idempotent mode change.
@@ -538,9 +591,13 @@ impl Supervisor {
     /// - **Tracking**: actual rpm more than `VERIFY_TOLERANCE_RPM` from the
     ///   last written value ⇒ idempotent re-assert of the write, *never
     ///   counted* — a fan still decelerating is not a broken fan.
-    /// - **Stall detector**: command unchanged for `STALL_POLLS` consecutive
-    ///   polls with the deviation still beyond tolerance and never decreased
-    ///   ⇒ unresponsive actuator ⇒ loud error, AUTO + monitor-only.
+    /// - **Stall detector** (RULING F20 R1): while armed and off-target, a
+    ///   poll counts as progress when the tach moved since the previous poll
+    ///   (beyond `STALL_TACH_EPSILON_RPM`) or the fan is within tolerance; a
+    ///   command change never resets the window. `STALL_POLLS` motionless,
+    ///   off-target polls ⇒ unresponsive actuator ⇒ loud error, AUTO +
+    ///   monitor-only. Off-target dwell beyond `OFF_TARGET_WARN_POLLS`
+    ///   emits one WARN per excursion (R4, no degradation).
     ///
     /// Only mode-drift failures, write-syscall errors and echo failures
     /// increment `write_failures` (`WRITE_FAIL_FALLBACK` → fallback).
@@ -558,10 +615,20 @@ impl Supervisor {
                 return false;
             }
         };
+        // RULING F20 (R1): the stall window keys on tach movement between
+        // polls — capture the previous poll's actual before overwriting it.
+        let prev_actual = self.prev_actual.replace(fan.rpm);
         if !self.manual_armed {
-            self.stall_cmd = None;
             self.stall_polls = 0;
+            self.off_target_polls = 0;
+            self.off_target_warned = false;
             return true; // not ours to verify
+        }
+        if self.auto_restore_pending {
+            // RULING F20 (R2): we are trying to release the fan to the
+            // firmware — no Manual re-assert, no tracking re-assert, nothing
+            // counted; `auto_restore_retry` already attempted AUTO this poll.
+            return true;
         }
         let mut failed = false;
         if fan.mode != FanMode::Manual {
@@ -590,37 +657,50 @@ impl Supervisor {
                     }
                 }
             }
-            // Stall detector (R3).
-            if self.stall_cmd != Some(written) {
-                self.stall_cmd = Some(written);
-                self.stall_polls = 1;
-                self.stall_base_dev = dev;
-                self.stall_min_dev = dev;
-            } else {
-                self.stall_polls = self.stall_polls.saturating_add(1);
-                self.stall_min_dev = self.stall_min_dev.min(dev);
-                // INVARIANT: convergence restarts the window — a fan that is
-                // still approaching the command is never a stalled one.
-                if dev < self.stall_base_dev {
-                    self.stall_base_dev = dev;
-                    self.stall_min_dev = dev;
-                    self.stall_polls = 1;
-                }
-                if self.stall_polls >= STALL_POLLS
-                    && dev > VERIFY_TOLERANCE_RPM
-                    && self.stall_min_dev >= self.stall_base_dev
-                {
+            // Stall detector (RULING F20 R1): keyed on tach movement, not on
+            // command changes — a moving command cannot buy a dead actuator a
+            // fresh window. Plus off-target dwell visibility (R4).
+            if dev > VERIFY_TOLERANCE_RPM {
+                self.off_target_polls = self.off_target_polls.saturating_add(1);
+                if !self.off_target_warned && self.off_target_polls >= OFF_TARGET_WARN_POLLS {
+                    self.off_target_warned = true;
                     let msg = format!(
-                        "stall detector: command {written} unchanged for {STALL_POLLS} polls, fan stuck {dev} rpm away and never closer; actuator unresponsive"
+                        "fan rpm off target for {} polls (moving, not stalled)",
+                        self.off_target_polls
                     );
-                    tracing::error!("{msg}");
+                    tracing::warn!("{msg}");
                     self.note_recent(msg.clone());
                     notes.push(msg);
-                    self.stall_cmd = None;
-                    self.stall_polls = 0;
-                    self.degrade_to_auto(notes);
-                    return false;
                 }
+                // INVARIANT: only observed tach movement or convergence
+                // resets the stall window; a written-target change resets
+                // nothing (the F20 MAJOR-1 hole).
+                let moved =
+                    prev_actual.is_some_and(|prev| fan.rpm.abs_diff(prev) > STALL_TACH_EPSILON_RPM);
+                if moved {
+                    self.stall_polls = 0;
+                } else {
+                    self.stall_polls = self.stall_polls.saturating_add(1);
+                    if self.stall_polls >= STALL_POLLS {
+                        let msg = format!(
+                            "stall detector: fan stuck {dev} rpm off target with a motionless tach for {STALL_POLLS} polls; actuator unresponsive"
+                        );
+                        tracing::error!("{msg}");
+                        self.note_recent(msg.clone());
+                        notes.push(msg);
+                        self.stall_polls = 0;
+                        self.off_target_polls = 0;
+                        self.off_target_warned = false;
+                        self.degrade_to_auto(notes);
+                        return false;
+                    }
+                }
+            } else {
+                // Within tolerance: progress by definition; one fresh
+                // excursion later warns again (R4: once per excursion).
+                self.stall_polls = 0;
+                self.off_target_polls = 0;
+                self.off_target_warned = false;
             }
         }
         if failed {
@@ -650,33 +730,94 @@ impl Supervisor {
         }
     }
 
-    /// Fallback: restore AUTO (best effort — even this may fail) and latch
-    /// monitor-only so never another fan write until a fresh command (R4).
+    /// Fallback: restore AUTO and latch monitor-only so no other fan write
+    /// happens until a fresh command (R4). RULING F20 (R2): only an `Ok`
+    /// verify commits the release — a failed `set_mode(Auto)` keeps the fan
+    /// owned (`manual_armed` stays true) and arms `auto_restore_pending`, so
+    /// the poll loop re-attempts AUTO every poll instead of stranding it in
+    /// Manual, unsupervised.
     fn degrade_to_auto(&mut self, notes: &mut Vec<String>) {
-        match self.smc.set_mode(FanMode::Auto) {
-            Ok(_) => notes.push("fallback: fan1_manual=0 (AUTO)".into()),
-            Err(_) => {
-                // SAFETY-INVARIANT: if even AUTO fails we stay degraded and
-                // keep counting; L2/L3 remain the final nets.
-                let msg = "fallback: set AUTO itself failed; monitor-only without AUTO restore";
-                tracing::error!("{msg}");
-                self.note_recent(msg.to_owned());
-            }
-        }
         self.monitor_only = true;
-        self.manual_armed = false;
         self.last_written = None;
         self.write_failures = 0;
-        self.stall_cmd = None;
         self.stall_polls = 0;
-        tracing::error!(
-            "L1 fallback: {} failed writes → AUTO restored, degrading to monitor-only",
-            WRITE_FAIL_FALLBACK
+        self.off_target_polls = 0;
+        self.off_target_warned = false;
+        match self.smc.set_mode(FanMode::Auto) {
+            Ok(_) => {
+                self.manual_armed = false;
+                self.auto_restore_pending = false;
+                self.auto_restore_attempts = 0;
+                let msg = format!(
+                    "L1 fallback: {WRITE_FAIL_FALLBACK} failed writes → AUTO restored, degrading to monitor-only"
+                );
+                tracing::error!("{msg}");
+                self.note_recent(msg);
+                self.note_recent(
+                    "L1 fallback: monitor-only degradation after repeated write failures".into(),
+                );
+                notes.push("fallback: AUTO + monitor-only".into());
+            }
+            Err(e) => {
+                // SAFETY-INVARIANT: the restore failed, so we still own the
+                // fan and must not drop supervision: keep `manual_armed`,
+                // arm the every-poll AUTO retry. L2/L3 remain the death nets.
+                self.auto_restore_pending = true;
+                self.auto_restore_attempts = 1;
+                self.auto_retry_log_polls = AUTO_RETRY_LOG_POLLS;
+                let msg = format!(
+                    "L1 fallback: {WRITE_FAIL_FALLBACK} failed writes → AUTO restore FAILED ({e}); fan still Manual, retrying AUTO every poll, monitor-only"
+                );
+                tracing::error!("{msg}");
+                self.note_recent(msg.clone());
+                notes.push(msg);
+            }
+        }
+        notes.push("fallback: monitor-only".into());
+    }
+
+    /// RULING F20 (R2): one best-effort `set_mode(Auto)` per poll while an
+    /// AUTO restore is pending; the log is rate-limited to one ERROR every
+    /// `AUTO_RETRY_LOG_POLLS` polls naming the attempt count. On the first
+    /// success (a verified write or the register already reading `Auto`):
+    /// clear the flag and note it — never claim success without a verified
+    /// read-back, never stop retrying.
+    fn auto_restore_retry(&mut self, notes: &mut Vec<String>) {
+        if !self.auto_restore_pending {
+            return;
+        }
+        self.auto_restore_attempts = self.auto_restore_attempts.saturating_add(1);
+        let register_auto = matches!(
+            self.smc.read_fan().ok().map(|f| f.mode),
+            Some(FanMode::Auto)
         );
-        self.note_recent(
-            "L1 fallback: monitor-only degradation after repeated write failures".into(),
+        if !register_auto && self.smc.set_mode(FanMode::Auto).is_err() {
+            if self.auto_retry_log_polls == 0 {
+                let msg = format!(
+                    "AUTO restore still pending: {} failed attempts, fan still in Manual; retrying AUTO every poll",
+                    self.auto_restore_attempts
+                );
+                tracing::error!("{msg}");
+                self.note_recent(msg);
+                self.auto_retry_log_polls = AUTO_RETRY_LOG_POLLS;
+            } else {
+                self.auto_retry_log_polls -= 1;
+            }
+            return;
+        }
+        self.auto_restore_pending = false;
+        self.manual_armed = false;
+        self.last_written = None;
+        self.stall_polls = 0;
+        self.off_target_polls = 0;
+        self.off_target_warned = false;
+        let msg = format!(
+            "AUTO restored after {} attempts (fan1_manual=0, verified)",
+            self.auto_restore_attempts
         );
-        notes.push("fallback: AUTO + monitor-only".into());
+        tracing::info!("{msg}");
+        self.note_recent(msg.clone());
+        notes.push(msg);
     }
 
     // ---- step 5: state.json (R7) ----
@@ -708,6 +849,7 @@ impl Supervisor {
             actual_rpm: self.last_actual,
             verified,
             monitor_only: self.monitor_only,
+            auto_restore_pending: self.auto_restore_pending,
             watchdog_pings: self.watchdog_pings,
             recent_errors: &self.recent_errors,
         };
@@ -802,7 +944,9 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // T9-F4: tests are allowlisted (§8)
 
     use super::*;
-    use crate::policy::MilliC;
+    use crate::policy::{
+        Decision, MilliC, OFF_TARGET_WARN_POLLS, STALL_POLLS, VERIFY_TOLERANCE_RPM,
+    };
     use crate::smc::{MockSmc, SensorReading};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1499,5 +1643,274 @@ mod tests {
             "each mode-drift re-assert is recorded: {:?}",
             sup.recent_errors
         );
+    }
+
+    // ---- RULING F20 (ticket tests 1–6) ----
+
+    /// 84 °C plateau sensor: mid-band, one step above the hot() plateau.
+    fn hot_high() -> SensorReading {
+        SensorReading {
+            label: "Core 0".to_string(),
+            milli_c: Some(MilliC(84_000)),
+        }
+    }
+
+    /// RULING F20 test 1 (MAJOR 1 regression): sustained mid-band target
+    /// motion (alternating temps → the written target changes every poll)
+    /// with a frozen tach ⇒ the stall detector fires a few polls past
+    /// `STALL_POLLS`: monitor-only latches, the message is recorded. This
+    /// case defeated the pre-F20 command-change reset and silently passed.
+    #[test]
+    fn f20_moving_command_frozen_tach_stall_fires() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(6170, FanMode::Auto);
+        sm.set_tach_lag(1500);
+        sm.set_tach_frozen(true); // dead actuator: the tach never moves
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        let mut monitor_latched_at = None;
+        for poll in 1..=STALL_POLLS + 5 {
+            sm.set_sensors(if poll % 2 == 0 {
+                vec![hot()]
+            } else {
+                vec![hot_high()]
+            });
+            sup.step_once();
+            if sup.monitor_only {
+                monitor_latched_at = Some(poll);
+                break;
+            }
+        }
+        let latched = monitor_latched_at.expect("the stall detector must fire");
+        assert!(
+            latched <= STALL_POLLS + 3,
+            "stall fired at poll {latched}: the moving command must not delay it far past {STALL_POLLS}"
+        );
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("stall detector")),
+            "the stall message must be recorded: {:?}",
+            sup.recent_errors
+        );
+        assert_eq!(sm.fan().mode, FanMode::Auto, "AUTO restored");
+        assert_eq!(dir.state()["monitor_only"], true);
+        assert_eq!(
+            dir.state()["auto_restore_pending"],
+            false,
+            "restore verified"
+        );
+    }
+
+    /// RULING F20 test 2: a healthy fan under the same sustained motion (a
+    /// moving tach each poll) ⇒ no stall, no degrade, `write_failures == 0`.
+    #[test]
+    fn f20_sustained_motion_healthy_fan_never_stalls() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(6170, FanMode::Auto);
+        sm.set_tach_lag(1500); // moving fan: the tach tracks every poll
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        for poll in 1..=STALL_POLLS + 5 {
+            sm.set_sensors(if poll % 2 == 0 {
+                vec![hot()]
+            } else {
+                vec![hot_high()]
+            });
+            sup.step_once();
+            assert!(!sup.monitor_only, "no stall must latch (poll {poll})");
+        }
+        assert_eq!(sm.fan().mode, FanMode::Manual, "still owned");
+        assert_eq!(sup.write_failures, 0);
+    }
+
+    /// RULING F20 test 3 (MAJOR 2 regression): AUTO restore fails
+    /// (fault-injected) ⇒ `manual_armed` stays true, `auto_restore_pending`
+    /// is set and exposed, the "AUTO restored" success text is absent; then
+    /// a later successful attempt clears it with the "after N attempts" note.
+    #[test]
+    fn f20_failed_auto_restore_is_retried_truthfully() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"curve"}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_write_stuck(Some(HW_MIN)); // 3 failed writes → fallback
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once();
+        // Inject the AUTO restore verify failure before the third failure
+        // fires the fallback (set_mode(Auto) reads back Manual → VerifyFailed).
+        sm.set_mode_read_back(Some(FanMode::Manual));
+        for _ in 0..3 {
+            sup.step_once();
+            if sup.monitor_only {
+                break;
+            }
+        }
+        assert!(sup.monitor_only, "fallback latched");
+        assert!(sup.manual_armed, "we still own the stranded fan");
+        assert!(sup.auto_restore_pending, "the pending flag is armed");
+        assert!(
+            !sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("AUTO restored")),
+            "the success lie must be absent: {:?}",
+            sup.recent_errors
+        );
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("AUTO restore FAILED")),
+            "the truthful failure must be recorded: {:?}",
+            sup.recent_errors
+        );
+        assert_eq!(dir.state()["auto_restore_pending"], true);
+
+        // Two later failing attempts poll after poll (rate-limited log), then
+        // the fault clears and the next attempt succeeds.
+        for _ in 0..2 {
+            sup.step_once();
+            assert!(sup.auto_restore_pending, "retry until success");
+        }
+        sm.set_mode_read_back(None);
+        sup.step_once();
+        assert!(!sup.auto_restore_pending, "first success clears the flag");
+        assert!(!sup.manual_armed, "the fan is released");
+        assert_eq!(sm.fan().mode, FanMode::Auto);
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("AUTO restored after 4 attempts")),
+            "the 'after N attempts' note must be recorded: {:?}",
+            sup.recent_errors
+        );
+        assert_eq!(dir.state()["auto_restore_pending"], false);
+    }
+
+    /// RULING F20 test 4 (R3): with no L2 death path, a cmd.json writing mode
+    /// is refused — observe stays, zero writes, error recorded.
+    #[test]
+    fn f20_l2_absent_refuses_cmd_control() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":4000}"#);
+        let sm = mock_with(vec![hot()]);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.l2_absent = true; // the startup guard's verdict (panic_fd absent)
+        let rep = sup.step_once();
+        assert_eq!(rep.mode, RunMode::Observe);
+        assert_eq!(sm.write_attempts(), 0, "no control without L2");
+        assert!(
+            sup.recent_errors
+                .iter()
+                .any(|e| e.msg.contains("refusing to enter control")),
+            "error recorded: {:?}",
+            sup.recent_errors
+        );
+        assert_eq!(dir.state()["mode"], "observe");
+    }
+
+    /// RULING F20 test 5a: the stall detector fires at exactly `STALL_POLLS`
+    /// polls — not "within" (pinning, T9b finding 6).
+    #[test]
+    fn f20_stall_fires_exactly_at_stall_polls() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(6170, FanMode::Auto);
+        sm.set_tach_lag(1500);
+        sm.set_tach_frozen(true);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        for poll in 1..STALL_POLLS {
+            sup.step_once();
+            assert!(
+                !sup.monitor_only && sup.manual_armed,
+                "poll {poll} (< {STALL_POLLS}) must NOT degrade"
+            );
+        }
+        sup.step_once(); // the exact STALL_POLLS-th armed, off-target poll
+        assert!(sup.monitor_only, "stall fires at exactly STALL_POLLS");
+    }
+
+    /// RULING F20 test 6 (R4): off-target dwell warns exactly once per
+    /// excursion at `OFF_TARGET_WARN_POLLS`, and moving tachs never stall.
+    #[test]
+    fn f20_off_target_dwell_warns_once_per_excursion() {
+        let dir = TempDir::new();
+        dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":3000}"#);
+        let sm = mock_with(vec![hot()]);
+        sm.set_fan_state(2700, FanMode::Auto);
+        sm.set_tach_lag(1500);
+        sm.set_tach_frozen(true);
+        let mut sup = supervisor(&sm, RunMode::Observe, &dir);
+        sup.step_once(); // arm + write 3000; tach 2700 (300 off)
+        let warn_at = |n| format!("off target for {n} polls (moving, not stalled)");
+        // Excursion 1: alternate 2700 / 2760 each poll — 60 > 50 epsilon per
+        // poll, so the stall window never fills while the dwell accumulates.
+        let mut warned_at = None;
+        for excursion in 2..=OFF_TARGET_WARN_POLLS {
+            sm.set_fan_state(
+                if excursion % 2 == 0 { 2760 } else { 2700 },
+                FanMode::Manual,
+            );
+            sup.step_once();
+            if sup
+                .recent_errors
+                .iter()
+                .any(|e| e.msg.contains(&warn_at(OFF_TARGET_WARN_POLLS)))
+            {
+                warned_at = Some(excursion);
+                break;
+            }
+        }
+        let warned_at = warned_at.expect("the dwell warn must fire");
+        assert_eq!(
+            warned_at, OFF_TARGET_WARN_POLLS,
+            "warn fires exactly at OFF_TARGET_WARN_POLLS"
+        );
+        assert!(!sup.monitor_only, "no degradation from a dwell warn");
+        assert_eq!(sup.write_failures, 0);
+        // Converge: the excursion closes; then a second excursion warns again.
+        sm.set_fan_state(3000, FanMode::Manual);
+        sup.step_once();
+        let warns_before = sup
+            .recent_errors
+            .iter()
+            .filter(|e| e.msg.contains("(moving, not stalled)"))
+            .count();
+        assert_eq!(warns_before, 1, "exactly one warn per excursion");
+        for i in 1..=OFF_TARGET_WARN_POLLS {
+            sm.set_fan_state(if i % 2 == 0 { 2760 } else { 2700 }, FanMode::Manual);
+            sup.step_once();
+        }
+        let warns_total = sup
+            .recent_errors
+            .iter()
+            .filter(|e| e.msg.contains("(moving, not stalled)"))
+            .count();
+        assert!(warns_total >= 2, "the second excursion warns again");
+    }
+
+    /// RULING F20 test 5b (R5): the startup evidence line is pinned — every
+    /// field, including `config_source`, must survive regressions.
+    #[test]
+    fn startup_evidence_line_names_config_source() {
+        let dir = TempDir::new();
+        let sm = mock_with(vec![hot()]);
+        let sup = supervisor(&sm, RunMode::Curve, &dir);
+        let line = sup.startup_evidence_message(true, false);
+        for field in [
+            "afanctl daemon startup",
+            "mode=curve",
+            "l2_armed=true",
+            "watchdog_notify=false",
+            "state_file=",
+            "config_source=",
+            "hw_band=1200..7200",
+        ] {
+            assert!(
+                line.contains(field),
+                "evidence line must carry `{field}`: {line}"
+            );
+        }
     }
 }
