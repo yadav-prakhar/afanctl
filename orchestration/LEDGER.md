@@ -126,3 +126,20 @@
   usr/lib/systemd/system/afanctl.service, etc/afanctl/afanctl.toml with `backup = etc/afanctl/afanctl.toml`,
   usr/share/polkit-1/rules.d/49-afanctl.rules. Cargo.lock tracked (`--locked` build valid). gdb-add-index
   notice is cosmetic (release build has no debuginfo). Install half remains user-gated.
+- [DEFECT F16 — CRITICAL functional, found on real hardware while starting gate (f)] `sudo afanctl curve`
+  at 20:06:19 → daemon latched monitor-only ~2 s later. Journal: 3× "fan1_output write not taken by
+  hardware; retrying … wrote=1200 read_back=6170/5235/1866" then "L1 fallback: 3 failed writes → AUTO
+  restored, degrading to monitor-only". Root cause (source-verified, not inferred): (1) `src/smc.rs:339`
+  verifies a `fan1_output` write against **`fan1_input`** (the tachometer) with ±150 rpm — a fan still
+  spinning down from 6.2k can never match a 1200 command, so every ramp and every takeover reads as
+  "write not taken"; (2) `src/supervisor.rs:514-600` `l1_poll` counts that same physical deviation as a
+  write failure → 3 polls → AUTO + monitor-only latch. Net: on real hardware curve mode disables itself
+  the instant the target moves >150 rpm. Fail-safe direction held (AUTO restored, loud logs) but the
+  primary feature was non-functional. Live context: SMC's own curve had the fan at ~6.2k rpm (its raw
+  TC0F 63.5 C) while our curve wanted 1200 rpm (coretemp t_eff 48-51 C). Missed by 126 tests and T9
+  because `MockSmc`/fixtures echo a write into `fan1_input` instantly — idealized physics.
+  RULING F16 frozen in DESIGN.md; ticket `orchestration/instructions/F16.md` dispatched (glm-5.3-flash
+  high): echo-verify against `fan1_output` (±50 rpm), L1 split (mode drift = counted failure; tracking =
+  re-assert, not counted), `STALL_POLLS = 10` stall detector for a genuinely dead actuator, and fixtures
+  gain tach-lag dynamics + the SMC-mirrors-its-own-target rule. P5 (f) marked BLOCKED until it lands.
+- [STATUS] Gate (e) not yet run (needs F14 reinstall, done) ; gate (f) blocked on F16; (d) soak unaffected.

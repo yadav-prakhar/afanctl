@@ -56,7 +56,13 @@ pub trait Smc: Send {
     fn read_fan(&self) -> Result<FanState, SmcError>;
     fn hw_min_rpm(&self) -> u32;
     fn hw_max_rpm(&self) -> u32;
-    /// Write + read-back-verify (R1 invariant). Returns the verified rpm.
+    /// RULING F16 (orchestrator, 2026-09-14): write verification for `fan1_output` reads back
+    /// **`fan1_output`** (the register we wrote), tolerance `WRITE_ECHO_TOLERANCE_RPM = 50`.
+    /// `fan1_input` is the tachometer and must never be a write-verification source: a fan that
+    /// is still spinning down is not a failed write. L1 splits mode-drift (a real failure,
+    /// counted) from tracking (re-assert only, never counted); a genuine unresponsive actuator is
+    /// caught by the `STALL_POLLS` stall detector. Reason: on real hardware the previous
+    /// semantics disabled control during every ramp (see F16 evidence in the ledger).
     fn write_speed(&mut self, rpm: u32) -> Result<u32, SmcError>;
     /// Write + read-back-verify. Returns the verified mode.
     fn set_mode(&mut self, mode: FanMode) -> Result<FanMode, SmcError>;
