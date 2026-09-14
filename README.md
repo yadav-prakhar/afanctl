@@ -211,7 +211,10 @@ restored. The commanded `mode` is kept as-is, so `mode: "curve"` with
 `monitor_only: true` means "curve was requested, but nothing is being written",
 and `recent_errors` names the cause. Human `status` renders this as
 `mode: curve (monitor-only)`. A plugin must render the latch, not the mode
-alone.
+alone. Likewise, while `auto_restore_pending` is `true`, `mode` may already
+read `observe` while the fan is still in Manual: the pending flag is the
+truth, and a non-zero `verified` in that state means "no counted failure this
+poll", not "the fan was released".
 
 `state.json` also carries `polls` — the number of completed polls since the
 daemon started, one per poll (additive field; the `v1` schema ids are

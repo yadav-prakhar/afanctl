@@ -37,11 +37,17 @@ pub const WATCHDOG_UNIT_SEC: u64 = 15;
 
 /// Largest legal `poll.interval_s` (RULING F21 R2): the unit's watchdog
 /// budget ([`WATCHDOG_UNIT_SEC`], 15 s) minus the worst-case in-poll
-/// blocking and a margin. F19's settle windows cost ≈ 2.7 s per failing
-/// `write_speed` (window × (`WRITE_RETRY_MAX` + 1)) and ≈ 1.8 s per failing
-/// `set_mode`; the supervisor pings the watchdog at the start *and* end of
-/// every poll, so a 12 s interval plus its own blocking keeps ≥ 3 s of
-/// margin under the 15 s budget. The former cap (14 = budget − 1) predates
+/// blocking and a margin. T9d's recomputation of the true in-poll ceiling
+/// from `smc.rs` (write window 1500 ms / 9 × 150 ms retries /
+/// `WRITE_RETRY_MAX` = 1; mode window 1000 ms): a common failing poll costs
+/// a failed `write_speed` ≈ 3.0 s **plus** a failing L1 mode re-assert
+/// ≈ 2.0 s ⇒ ≈ 5 s; with all four write paths failing in one poll
+/// (`apply_mode`'s `set_mode`, the curve's `write_speed`, L1's mode
+/// re-assert, L1's tracking re-assert) the ceiling is ≈ 10 s. The supervisor
+/// pings the watchdog at the start *and* end of every poll (`step_once`),
+/// so the watchdog-observed gap is bounded by
+/// `max(interval, in-poll work)` ≤ 12 s under the 15 s budget — not by the
+/// sum of the two. The former cap (14 = budget − 1) predates
 /// the settle window and let `interval_s = 14` push the ping gap to
 /// ≈ 15.0–15.5 s — past the watchdog, SIGABRT-crash-looping a *healthy*
 /// curve daemon exactly in the oscillating-temperature regime curve mode
