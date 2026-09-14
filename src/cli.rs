@@ -725,11 +725,15 @@ fn status_json(d: &StatusData) -> serde_json::Value {
     let running = d.state.is_some();
     serde_json::json!({
         "schema": "afanctl.status.v1",
-        // F7/D-T9-F7: Appendix B's `uptime_s` is approximated as
-        // pings × interval_s (the state file stores a ping count, not
-        // seconds; saturating multiply guards a pathological config).
+        // RULING F22: `uptime_s` = completed polls × interval_s — exact,
+        // because `polls` advances once per poll. The F21 R2 watchdog pings
+        // (two per poll; L3 audit trail) must NOT be used. Backwards
+        // compatibility: a `state.json` written by a daemon older than this
+        // build has no `polls`, so fall back to the old `watchdog_pings ×
+        // interval_s` estimate — correct for that build (one ping per poll)
+        // and transient. `saturating_mul` guards a pathological config.
         // RULING F18 (A1): `monitor_only` is additive; schema id stays v1.
-        "daemon": {"running": running, "mode": d.mode(), "monitor_only": d.monitor_only(), "auto_restore_pending": d.auto_restore_pending(), "watchdog_armed": running, "uptime_s": field("watchdog_pings").and_then(|p| p.as_u64()).map_or(0, |p| p.saturating_mul(d.config.interval_s))},
+        "daemon": {"running": running, "mode": d.mode(), "monitor_only": d.monitor_only(), "auto_restore_pending": d.auto_restore_pending(), "watchdog_armed": running, "uptime_s": field("polls").and_then(|p| p.as_u64()).or_else(|| field("watchdog_pings").and_then(|p| p.as_u64())).map_or(0, |n| n.saturating_mul(d.config.interval_s))},
         "sensors": d.sensors.iter().map(|s| serde_json::json!({"label": s.label, "temp_c": s.milli_c.map_or(serde_json::Value::Null, temp)})).collect::<Vec<_>>(),
         "effective": {"temp_c": d.t_eff.map_or(serde_json::Value::Null, temp), "method": "max"},
         "fan": {"rpm": d.fan.rpm, "min_rpm": d.hw_min, "max_rpm": d.hw_max, "target_rpm": field("target_rpm").cloned().unwrap_or(serde_json::Value::Null), "manual": d.fan.mode == FanMode::Manual},
@@ -1258,7 +1262,7 @@ mod tests {
         let env = RuntimeEnv::new();
         std::fs::write(
             env.state(),
-            r#"{"schema":"afanctl.state.v1","mode":"curve","target_rpm":3400,"watchdog_pings":42,"recent_errors":[{"ts":"t","msg":"x"}]}"#,
+            r#"{"schema":"afanctl.state.v1","mode":"curve","target_rpm":3400,"polls":42,"watchdog_pings":84,"recent_errors":[{"ts":"t","msg":"x"}]}"#,
         )
         .expect("seed state.json");
 
@@ -1272,7 +1276,10 @@ mod tests {
             value["daemon"]["monitor_only"], false,
             "F18 A1: healthy daemon reports the latch as false"
         );
-        assert_eq!(value["daemon"]["uptime_s"], 42, "pings × interval_s (1)");
+        assert_eq!(
+            value["daemon"]["uptime_s"], 42,
+            "RULING F22: polls × interval_s (42 × 1); the 84 pings are not used"
+        );
         assert_eq!(value["fan"]["rpm"], 1200, "live sysfs read");
         assert_eq!(value["fan"]["min_rpm"], 1200);
         assert_eq!(value["fan"]["max_rpm"], 7200);
@@ -1301,31 +1308,56 @@ mod tests {
         assert_eq!(value["effective"]["temp_c"], 45.0);
     }
 
-    /// F7/D-T9-F7: `uptime_s` is pings × interval_s from the config as
-    /// loaded — not the raw ping count.
+    /// RULING F22 test 2: `uptime_s` is `polls × interval_s` from the config
+    /// as loaded — exact, and independent of the watchdog ping count. Two
+    /// interval values (1 and 3) prove the multiplication.
     #[test]
-    fn status_uptime_s_multiplies_pings_by_interval() {
+    fn status_uptime_s_multiplies_polls_by_interval() {
         let env = RuntimeEnv::new();
         let cfg = env.dir.0.join("afanctl.toml");
         std::fs::write(
-            &cfg,
-            "[thresholds]\nhigh = 66\nmax = 86\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = 5\n",
+            env.state(),
+            r#"{"schema":"afanctl.state.v1","mode":"curve","polls":42,"watchdog_pings":84,"recent_errors":[]}"#,
         )
-        .expect("write config");
+        .expect("seed state.json");
+        for (interval, expected) in [(1u64, 42u64), (3, 126)] {
+            std::fs::write(
+                &cfg,
+                format!(
+                    "[thresholds]\nhigh = 66\nmax = 86\n[curve]\nmin_rpm = 1200\nmax_rpm = 6200\n[poll]\ninterval_s = {interval}\n"
+                ),
+            )
+            .expect("write config");
+            let g = Globals {
+                config: cfg.clone(),
+                sysfs_root: fixture_root(),
+            };
+            let data = gather_status(&g).expect("gather");
+            assert_eq!(
+                status_json(&data)["daemon"]["uptime_s"],
+                expected,
+                "42 polls × {interval} s interval"
+            );
+        }
+    }
+
+    /// RULING F22 test 3 (compatibility path): a `state.json` written by a
+    /// daemon older than this build has no `polls`, so `uptime_s` falls back
+    /// to the old `watchdog_pings × interval_s` estimate. Named as the
+    /// transient legacy path — never the live source.
+    #[test]
+    fn status_uptime_s_falls_back_to_pings_without_polls() {
+        let env = RuntimeEnv::new();
         std::fs::write(
             env.state(),
             r#"{"schema":"afanctl.state.v1","mode":"curve","watchdog_pings":42,"recent_errors":[]}"#,
         )
-        .expect("seed state.json");
-        let g = Globals {
-            config: cfg,
-            sysfs_root: fixture_root(),
-        };
-        let data = gather_status(&g).expect("gather");
+        .expect("seed legacy state.json");
+        let data = gather_status(&globals(&fixture_root())).expect("gather");
         assert_eq!(
             status_json(&data)["daemon"]["uptime_s"],
-            210,
-            "42 pings × 5 s interval"
+            42,
+            "legacy state without `polls`: watchdog_pings × interval_s (1)"
         );
     }
 

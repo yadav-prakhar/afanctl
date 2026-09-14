@@ -182,6 +182,7 @@ fn assert_state_v1(v: &serde_json::Value) {
         "verified",
         "monitor_only",
         "watchdog_pings",
+        "polls",
         "recent_errors",
     ] {
         assert!(v.get(key).is_some(), "state.{key} missing");
@@ -195,6 +196,10 @@ fn assert_state_v1(v: &serde_json::Value) {
         "F18 A1: additive latch flag"
     );
     assert!(v["watchdog_pings"].is_u64());
+    assert!(
+        v["polls"].is_u64(),
+        "RULING F22: additive completed-poll counter"
+    );
     assert!(v["recent_errors"].is_array());
 }
 
@@ -267,6 +272,10 @@ fn once_state_file_matches_afanctl_state_v1() {
     assert_eq!(state["target_rpm"], 1200);
     assert_eq!(state["last_written_rpm"], 1200);
     assert_eq!(state["verified"], true);
+    assert_eq!(
+        state["polls"], 1,
+        "RULING F22: `once` is one completed poll (id stays afanctl.state.v1)"
+    );
     assert_eq!(
         state["monitor_only"], false,
         "F18 A1: a healthy once-write is not latched"
