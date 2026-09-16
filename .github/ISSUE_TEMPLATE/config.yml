@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / FAQ
+    url: https://github.com/yadav-prakhar/afanctl/wiki/Troubleshooting-and-FAQ
+    about: Check the FAQ first, then open an issue with the `question` label
+  - name: Security issue
+    url: https://github.com/yadav-prakhar/afanctl/security/advisories/new
+    about: Report privately — never a public issue (see SECURITY.md)

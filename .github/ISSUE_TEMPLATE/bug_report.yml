@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a problem with afanctl
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in everything you can.
+        **Security issues** (fan left in Manual, sandbox escape, privilege
+        problem) → do NOT use this form; see [SECURITY.md](../blob/master/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `afanctl --version`, or the package version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel
+      description: Output of `uname -r`
+      placeholder: 7.2.3-arch1-3
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what you saw instead
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Diagnostics
+      description: Output of `sudo afanctl doctor` and `afanctl status` (paste both)
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-checks
+      options:
+        - label: I restarted the unit after the last reinstall (`sudo systemctl restart afanctl`) and confirmed a fresh startup line in the journal (stale-binary trap)
+          required: false
+        - label: I ran `doctor` as root (non-root FAILs the write-mode checks by design)
+          required: false
+        - label: I checked the [Troubleshooting and FAQ](https://github.com/yadav-prakhar/afanctl/wiki/Troubleshooting-and-FAQ) wiki page
+          required: false
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: Contents of /etc/afanctl/afanctl.toml, if relevant (redact nothing — it has no secrets)
+      render: toml
