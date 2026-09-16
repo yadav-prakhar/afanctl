@@ -5,9 +5,10 @@
 # daemon starts in observe mode regardless (R9).
 #
 # This is the DEVELOPMENT PKGBUILD: it builds the working tree and is what
-# `.github/workflows/release.yml` builds the release artifact with. The
-# PUBLISHED package (the AUR one, built from a released source tarball) lives
-# in `packaging/aur/` — change both when the installed file set changes.
+# `.github/workflows/release.yml` builds the release artifact with — the one
+# `install.sh` fetches. The recipe that builds a *released tarball* (for the AUR,
+# if it is ever published) lives in `packaging/aur/`; change both when the
+# installed file set changes. See `packaging/README.md`.
 pkgname=afanctl
 pkgver=0.1.0
 pkgrel=1

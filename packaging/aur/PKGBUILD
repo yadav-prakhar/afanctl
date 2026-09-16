@@ -3,6 +3,11 @@
 # https://github.com/yadav-prakhar/afanctl is the source of truth for this
 # file; packaging/aur/update-aur.sh regenerates the sums for a new release.
 #
+# STATUS: not published. The AUR has closed registration to new maintainers, so
+# the release package is the distribution channel (install.sh at the repo root).
+# This recipe is complete and builds from the released tarball — see
+# ../README.md for how to push it if registration reopens.
+#
 # The systemd unit installs DISABLED and the daemon starts in observe mode
 # regardless, so installing this package changes nothing until the user runs
 # `systemctl enable --now afanctl` (R9).

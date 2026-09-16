@@ -49,25 +49,40 @@ Full rationale and constants: [Safety Model](https://github.com/yadav-prakhar/af
 ## Install
 
 ```sh
-# Arch / Omarchy — from the AUR
-yay -S afanctl
+# one command: fetches the package attached to the latest release, checks its
+# SHA-256 against that release's SHA256SUMS, and installs it with pacman
+curl -fsSL https://github.com/yadav-prakhar/afanctl/releases/latest/download/install.sh | sudo bash
+```
 
-# or the package attached to the latest GitHub release
-gh release download --repo yadav-prakhar/afanctl --pattern 'afanctl-[0-9]*x86_64.pkg.tar.zst'
-sudo pacman -U afanctl-[0-9]*x86_64.pkg.tar.zst
+That is the whole install. The script lives in this repo as
+[`install.sh`](install.sh) — read it before you pipe it, or ask it to resolve,
+download and verify without installing:
 
-# or build it yourself from a checkout
+```sh
+curl -fsSL https://github.com/yadav-prakhar/afanctl/releases/latest/download/install.sh | bash -s -- --dry-run
+curl -fsSL https://github.com/yadav-prakhar/afanctl/releases/latest/download/install.sh | sudo bash -s -- --version 0.1.0
+```
+
+```sh
+# from a checkout instead
 cd packaging && makepkg -si
 ```
 
 ```sh
-# the unit installs DISABLED and starts in observe mode — nothing changes yet
+# either way the unit installs DISABLED and starts in observe mode
 sudo systemctl enable --now afanctl
 systemctl status afanctl
+afanctl status
 ```
 
 Neither the package nor `systemctl enable` hands the fan over: the daemon starts
-in `observe`, writing nothing, until you ask for `curve`.
+in `observe`, writing nothing, until you ask for `curve`. Re-run the install
+command to upgrade; `sudo pacman -R afanctl` removes it.
+
+> **Not on the AUR yet.** Registration there is closed to new maintainers, so
+> the release package is the distribution channel; `packaging/aur/` keeps the
+> AUR recipe ready for when that changes, and
+> [`packaging/README.md`](packaging/README.md) tracks every channel.
 
 ```sh
 afanctl status          # temps, t_eff, mode, fan, config provenance
@@ -154,7 +169,7 @@ sysfs trees; ordinary development **never writes to the real `/sys`**.
 | Why not mbpfan / fancontrol | [afanctl vs mbpfan](https://github.com/yadav-prakhar/afanctl/wiki/afanctl-vs-mbpfan) |
 | Requirements & build plan | `PRD.md` · `PLAN.md` · `DESIGN.md` in this repo |
 | To contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
-| To publish a release (AUR, Omarchy) | [`packaging/aur/README.md`](packaging/aur/README.md) |
+| To publish a release (GitHub, AUR, Omarchy) | [`packaging/README.md`](packaging/README.md) |
 
 ## Contributing
 

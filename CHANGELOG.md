@@ -33,16 +33,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Distribution
 
+- **One-command install from a GitHub release:**
+  `curl -fsSL https://github.com/yadav-prakhar/afanctl/releases/latest/download/install.sh | sudo bash`.
+  `install.sh` reads the release's `SHA256SUMS`, downloads the `x86_64` package
+  it names, verifies the SHA-256 (a mismatch aborts before pacman runs) and
+  installs it with `pacman -U`. `--dry-run` verifies without installing,
+  `--version` pins a release, and it never enables or starts the unit. Being
+  version-agnostic, it survives future releases untouched.
 - Tagged releases are built and published by `.github/workflows/release.yml` in
   a clean Arch Linux container: the four gates, the package, the versioned
-  source tarball, and `SHA256SUMS`, all attached to the GitHub release
-  (`.gitattributes` keeps `packaging/aur` out of the tarball so its checksum is
-  not self-referential).
-- `packaging/aur/` holds the published AUR package — `yay -S afanctl` — plus
-  `update-aur.sh`, which points it at a new tarball and regenerates `.SRCINFO`.
-- `packaging/aur/README.md` documents the whole path: GitHub release → AUR →
-  [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs) (which
-  builds from the AUR package once a maintainer merges its addition).
+  source tarball, `install.sh` and `SHA256SUMS`, all attached to the GitHub
+  release. `.gitattributes` keeps `packaging/aur` out of the tarball so a
+  published checksum is never self-referential.
+- `packaging/README.md` documents every channel: the release artifacts (live),
+  the complete-but-unpublished AUR recipe in `packaging/aur/` (the AUR has closed
+  registration to new maintainers), a proposal to the
+  [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs/pull/476)
+  that tracks releases independently of the AUR, and `cargo publish` for
+  crates.io when it is wanted.
 
 ### Verified
 

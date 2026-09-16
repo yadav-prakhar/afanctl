@@ -39,8 +39,9 @@ charge, loudly logged.** That is implemented as four layers:
 ## 2. Install and use
 
 ```sh
-# install (from the AUR — `packaging/aur/` — or from a released package)
-yay -S afanctl
+# install (one command — verifies the release checksum, then pacman -U)
+curl -fsSL https://github.com/yadav-prakhar/afanctl/releases/latest/download/install.sh | sudo bash
+
 # ...or build + install the working tree (the package is also already built at
 # packaging/*.pkg.tar.zst)
 cd packaging && makepkg -si
@@ -118,7 +119,7 @@ SMC's own target while in AUTO, so a write must be preceded by a verified manual
 **Nothing in the spec.** Every PRD §9.3 (a–g) and §9.4 step is passed on hardware, and the pre-publish
 name check (PRD Q1) was re-run on 2026-09-16 — `afanctl` is still free on the AUR and on crates.io. What
 remains is the accepted deviation below, plus whatever the next release needs
-(`packaging/aur/README.md`).
+(`packaging/README.md`).
 
 **Known deviations and residuals (none hidden):**
 
@@ -150,4 +151,4 @@ remains is the accepted deviation below, plus whatever the next release needs
 | Every ruling, dispatch, merge, bounce and gate result | `orchestration/LEDGER.md` |
 | What each adversarial round found | `orchestration/REVIEW-T9*.md` |
 | What each subagent was told | `orchestration/instructions/*.md` |
-| How a release reaches the AUR and Omarchy | `packaging/aur/README.md` · `.github/workflows/release.yml` |
+| How a release reaches users (GitHub, AUR, Omarchy) | `packaging/README.md` · `.github/workflows/release.yml` · `install.sh` |
