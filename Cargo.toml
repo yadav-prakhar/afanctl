@@ -5,6 +5,8 @@ edition = "2021"
 rust-version = "1.98"
 description = "applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
 license = "GPL-3.0-only"
+repository = "https://github.com/yadav-prakhar/afanctl"
+homepage = "https://github.com/yadav-prakhar/afanctl/wiki"
 
 # DESIGN §8 (T9-F4): unwrap/expect/panic are denied by every `-D warnings`
 # gate (check.sh gates 2 and 2b). Scoped allowlists live ONLY inside
