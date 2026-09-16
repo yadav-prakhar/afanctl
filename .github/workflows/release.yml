@@ -38,6 +38,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The container's user is not the owner of the workspace git hands over,
+      # and git refuses to read a repository it does not own.
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: The tag, Cargo.toml and the PKGBUILD must agree
         run: |
           set -euo pipefail
