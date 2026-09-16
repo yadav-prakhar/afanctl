@@ -9,7 +9,7 @@ How a release becomes installable — from `yay -S afanctl`, from a released
 | ------- | -------- | ------------- |
 | GitHub release | source tarball, `afanctl-<ver>-1-x86_64.pkg.tar.zst`, `SHA256SUMS` | `.github/workflows/release.yml` (tag push) |
 | AUR (`afanctl`) | this directory's `PKGBUILD` + `.SRCINFO` | `update-aur.sh` |
-| Omarchy Package Repository (`pkgs.omarchy.org`) | built from the AUR package | a PR to [omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs) |
+| Omarchy Package Repository (`pkgs.omarchy.org`) | a recipe they own, watching our tagged releases | [omacom/omarchy-pkgs#476](https://github.com/omacom/omarchy-pkgs/pull/476) — their merge decides it |
 
 `packaging/PKGBUILD` (one level up) is the *development* PKGBUILD: it builds the
 package from a working tree. It is not published anywhere. This directory is the
@@ -43,10 +43,14 @@ The AUR takes pushes over SSH only, and the key must be listed in your AUR
 account, so this part is yours to do once:
 
 ```sh
+# 0. create the account: https://aur.archlinux.org/register (email verification),
+#    then confirm the address from the link it sends.
+
 # 1. a key pair used for nothing else (AUR recommends a dedicated one)
 ssh-keygen -t ed25519 -f ~/.ssh/aur -C aur
 
-# 2. add the pubkey to https://aur.archlinux.org/account (My Account → SSH Public Key)
+# 2. paste the PUBKEY into https://aur.archlinux.org/account
+#    (My Account → SSH Public Key)
 cat ~/.ssh/aur.pub
 
 # 3. tell ssh to use it for the AUR
@@ -60,6 +64,13 @@ EOF
 git -c init.defaultBranch=master clone ssh://aur@aur.archlinux.org/afanctl.git ~/Work/aur/afanctl
 packaging/aur/update-aur.sh 0.1.0 --aur-dir ~/Work/aur/afanctl --push
 ```
+
+Check the auth before blaming the package — `ssh -T aur@aur.archlinux.org` is a
+`Permission denied (publickey)` until the pubkey is registered, and works
+silently afterwards. Verify the server's key fingerprint the first time: the
+AUR's Ed25519 host key is
+`SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4`
+(`ssh-keyscan -t ed25519 aur.archlinux.org | ssh-keygen -lf -`).
 
 `update-aur.sh` refuses to invent metadata: it reads `url=` from this
 directory's PKGBUILD, so the release URL and the AUR package can never drift.
@@ -75,13 +86,22 @@ copy is never stale, because step 3 writes it there.
 
 ## Omarchy
 
-Omarchy's package repository builds packages *from this AUR package*: their
-`bin/add-package afanctl` copies the AUR PKGBUILD into
-`pkgbuilds/afanctl/` with `.omarchy/package.json` recording `{"source": "aur"}`
-plus the AUR commit it synced, and their builder then tracks the AUR package
-every 6 hours. Nothing ships to `pkgs.omarchy.org` until a maintainer merges
-that addition, so publishing to the AUR is the prerequisite — after that it is a
-pull request against `omacom/omarchy-pkgs`.
+The Omarchy Package Repository owns its own recipes: a package is added as
+`pkgbuilds/<name>/` under [omacom/omarchy-pkgs](https://github.com/omacom/omarchy-pkgs),
+and every recipe carries an `upstream.watch` so their `bin/sync-upstream` picks
+up new releases on its own. Getting in is a pull request they merge — nothing
+this repository does can force it.
+
+That request is open as
+[omacom/omarchy-pkgs#476](https://github.com/omacom/omarchy-pkgs/pull/476). It
+adds `afanctl` sourced from the **tagged GitHub tarball**
+(`archive/refs/tags/v$pkgver.tar.gz`, which respects the `export-ignore` in
+`.gitattributes`, so their build never sees this directory) with a `github`
+watch on `yadav-prakhar/afanctl`. Their recipe is authoritative once merged —
+this repository does not mirror it, precisely so the two cannot drift.
+
+If the request is declined, nothing here breaks: the AUR package and the
+release artifacts stand on their own.
 
 ## Verifying a package without installing it
 
