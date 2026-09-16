@@ -1,0 +1,7 @@
+version = 1
+
+[[annotations]]
+path = ["PKGBUILD", ".SRCINFO"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Prakhar Yadav <pkrc267 at gmail dot com>"
+SPDX-License-Identifier = "0BSD"

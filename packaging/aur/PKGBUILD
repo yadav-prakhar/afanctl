@@ -1,0 +1,42 @@
+# Maintainer: Prakhar Yadav <pkrc267 at gmail dot com>
+# Published from the upstream repository — packaging/aur/ at
+# https://github.com/yadav-prakhar/afanctl is the source of truth for this
+# file; packaging/aur/update-aur.sh regenerates the sums for a new release.
+#
+# The systemd unit installs DISABLED and the daemon starts in observe mode
+# regardless, so installing this package changes nothing until the user runs
+# `systemctl enable --now afanctl` (R9).
+pkgname=afanctl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Safety-first applesmc fan supervisor for pre-T2 Intel Macs (A1708)"
+arch=('x86_64')
+url="https://github.com/yadav-prakhar/afanctl"
+license=('GPL-3.0-only')
+depends=('glibc' 'gcc-libs')
+makedepends=('cargo')
+# pacman preserves user edits across upgrades (R6/H5).
+backup=('etc/afanctl/afanctl.toml')
+source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
+sha256sums=('9dec3a9ab06ab9a825219313843a425d5c9677683999064ff243fcfb57ebaebb')
+
+build() {
+    cd "$pkgname-$pkgver"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    install -Dm755 "$srcdir/target/release/afanctl" \
+        "$pkgdir/usr/bin/afanctl"
+    install -Dm644 packaging/afanctl.service \
+        "$pkgdir/usr/lib/systemd/system/afanctl.service"
+    install -Dm644 packaging/afanctl.toml.default \
+        "$pkgdir/etc/afanctl/afanctl.toml"
+    install -Dm644 packaging/afanctl.toml.default \
+        "$pkgdir/usr/share/afanctl/afanctl.toml.default"
+    install -Dm644 packaging/49-afanctl.rules \
+        "$pkgdir/usr/share/polkit-1/rules.d/49-afanctl.rules"
+}

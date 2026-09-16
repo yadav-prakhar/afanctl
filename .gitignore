@@ -4,3 +4,7 @@ target/
 packaging/pkg/
 packaging/src/
 packaging/*.pkg.tar.zst
+packaging/aur/src/
+packaging/aur/pkg/
+packaging/aur/*.pkg.tar.zst
+packaging/aur/*.tar.gz
