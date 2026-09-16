@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME#v}"
-          cargo_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          cargo_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | sed -n '1p')"
           pkg_version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
           echo "tag=$tag cargo=$cargo_version pkgver=$pkg_version"
           [ "$tag" = "$cargo_version" ] || { echo "::error::tag v$tag != Cargo.toml $cargo_version"; exit 1; }
@@ -59,10 +59,14 @@ jobs:
           set -euo pipefail
           git archive --format=tar.gz --prefix="afanctl-$VERSION/" \
             -o "afanctl-$VERSION.tar.gz" "$GITHUB_REF_NAME"
-          tar -tzf "afanctl-$VERSION.tar.gz" | head -5
+          listing="$(tar -tzf "afanctl-$VERSION.tar.gz")"
+          printf '%s\n' "$listing" | sed -n '1,5p'
           # packaging/aur is export-ignored; it must not be in here, or its
           # checksum would have to describe a tarball containing that checksum.
-          ! tar -tzf "afanctl-$VERSION.tar.gz" | grep -q '^afanctl-.*/packaging/aur/'
+          if printf '%s\n' "$listing" | grep -q '/packaging/aur/'; then
+            echo "::error::packaging/aur must not be in the release tarball"
+            exit 1
+          fi
           sha256sum "afanctl-$VERSION.tar.gz" > SHA256SUMS
 
       # makepkg refuses to run as root, so the build runs as an ordinary user.
