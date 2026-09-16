@@ -1,8 +1,9 @@
 # HANDOFF — afanctl (A1708 pre-T2 Intel Mac fan supervisor)
 
-**State: build complete and review-gate CLOSED. The hardware gate is partially passed; four items remain
-and they require you at the machine.** This document is the operator's handoff: what exists, how to
-install and use it, what was verified and how, what is honestly still open, and what to do next.
+**State: build complete, review gate CLOSED, and the full hardware acceptance gate PASSED** (final
+reboot test 2026-09-15 02:17 — `orchestration/LEDGER.md`, "HW GATE — COMPLETE"). This document is the
+operator's handoff: what exists, how to install and use it, what was verified and how, what is honestly
+still open, and what to do next.
 
 - Repo: `/home/prakhar/Work/tries/2026-09-14-a1708-fanctl` (branch `master`)
 - Authoritative documents: `PRD.md` (requirements) · `DESIGN.md` (binding contracts + conventions) ·
@@ -38,7 +39,10 @@ charge, loudly logged.** That is implemented as four layers:
 ## 2. Install and use
 
 ```sh
-# build + install (the package is also already built at packaging/*.pkg.tar.zst)
+# install (from the AUR — `packaging/aur/` — or from a released package)
+yay -S afanctl
+# ...or build + install the working tree (the package is also already built at
+# packaging/*.pkg.tar.zst)
 cd packaging && makepkg -si
 
 # after ANY reinstall, restart and confirm the loaded build:
@@ -93,25 +97,28 @@ SMC's own target while in AUTO, so a write must be preceded by a verified manual
   updates the target register on a ~1 s tick, so the fixed echo check still failed on hardware until the
   verification was given a settle window (F19). Mocks and fixtures now model all three behaviours
   (`set_tach_lag`, `set_tach_frozen`, `set_write_stuck`, `set_echo_latency`).
-- **Gate results so far**: (a) `doctor` PASS, (b) `doctor --roundtrip` PASS (manual 2 s → AUTO restored),
-  (c) `selftest-panic` PASS (`fan1_manual` = 0 after), (d) observe soak PASS — 1 h 10 min, 1.966 s CPU
-  over 4211 s wall (0.05 %, budget < 0.1 %), 2.4 MB peak RSS (budget < 5 MB), zero errors,
-  (e) `SIGKILL` in curve mode PASS — restarted, journal shows the reconcile restoring AUTO, `fan1_manual`
-  read 0. **`curve` genuinely controls the fan on hardware** (`manual = 1` within 3 s, target and rpm
-  tracking).
+- **Hardware gate: §9.3 (a–g) and §9.4 fully discharged** (authoritative record:
+  `orchestration/LEDGER.md`). (a) `doctor` PASS — 10 checks after the reboot, (b) `doctor --roundtrip`
+  PASS (manual 2 s → AUTO restored), (c) `selftest-panic` PASS (`fan1_manual` = 0 after), (d) observe soak
+  PASS — 1 h 10 min, 1.966 s CPU over 4211 s wall (0.05 %, budget < 0.1 %), 2.4 MB peak RSS
+  (budget < 5 MB), zero errors, (e) `SIGKILL` in curve mode PASS — restarted, journal shows the reconcile
+  restoring AUTO, `fan1_manual` read 0, (f) curve soak + `doctor --compare 600` PASS — mean Δ 191 rpm,
+  max |Δ| 2260, ours quieter 198 / louder 392 / equal 10, i.e. **more responsive to `coretemp`, not
+  quieter**, (g) `pkexec hold 3000` PASS (the polkit rule worked passwordlessly; `doctor` warns while the
+  fan is held), `systemctl enable` + reboot PASS — boots into observe, firmware owns the fan, 1216 rpm on
+  the SMC curve. **`curve` genuinely controls the fan on hardware** (`manual = 1` within 3 s, target and
+  rpm tracking).
+- **Two defects the gate itself exposed, both closed and re-verified live**: F24 (mode changes were never
+  journalled, so the (f) soak left no evidence of control being taken) and F25 (`doctor` was blind to a
+  held fan). They landed after the 23:29 install; the 02:02 package carries them and the ledger records
+  the live `mode change:` lines and the hold WARN.
 
 ## 5. Still open (honest list)
 
-**Hardware steps that need you** (the only real-sysfs session; the orchestrator never ran them):
-
-- (f) `sudo afanctl curve`, soak ~1 h watching `afanctl status`; then `sudo afanctl observe` and
-  `sudo afanctl doctor --compare 600` for the empirical SMC-vs-ours table.
-- (g) `pkexec afanctl hold 3000` from your user shell (polkit rule), confirm the fan reaches ~3000 and
-  `doctor`/`status` report hold; `afanctl once --at-temp 86 --dry-run` for the overshoot-guard simulation;
-  then `sudo afanctl observe`.
-- `sudo systemctl enable afanctl` + a reboot test (expected: boots in observe, fan on the SMC curve).
-- Before publishing anywhere: re-check the name on AUR/crates.io (PRD Q1 — it was free on 2026-09-14, and
-  `fanctl`/`macfanctl`/`smctl` are taken).
+**Nothing in the spec.** Every PRD §9.3 (a–g) and §9.4 step is passed on hardware, and the pre-publish
+name check (PRD Q1) was re-run on 2026-09-16 — `afanctl` is still free on the AUR and on crates.io. What
+remains is the accepted deviation below, plus whatever the next release needs
+(`packaging/aur/README.md`).
 
 **Known deviations and residuals (none hidden):**
 
@@ -143,3 +150,4 @@ SMC's own target while in AUTO, so a write must be preceded by a verified manual
 | Every ruling, dispatch, merge, bounce and gate result | `orchestration/LEDGER.md` |
 | What each adversarial round found | `orchestration/REVIEW-T9*.md` |
 | What each subagent was told | `orchestration/instructions/*.md` |
+| How a release reaches the AUR and Omarchy | `packaging/aur/README.md` · `.github/workflows/release.yml` |
