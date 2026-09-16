@@ -7,13 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Beautified `README.md` (centered hero, shields badges, concise sections with
-  wiki links) and standard open-source housekeeping (`CONTRIBUTING.md`,
-  `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue/PR templates, this changelog).
-
-## [0.1.0] - 2026-09-15
+## [0.1.0] - 2026-09-16
 
 ### Added
 
@@ -33,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the four quality gates in `check.sh`.
 - Docs: `README.md`, `PRD.md`, `DESIGN.md` (binding contracts), `PLAN.md`,
   project [wiki](https://github.com/yadav-prakhar/afanctl/wiki).
+- Beautified `README.md` (centered hero, shields badges, concise sections with
+  wiki links) and standard open-source housekeeping (`CONTRIBUTING.md`,
+  `CODE_OF_CONDUCT.md`, `SECURITY.md`, issue/PR templates, this changelog).
+
+### Distribution
+
+- Tagged releases are built and published by `.github/workflows/release.yml` in
+  a clean Arch Linux container: the four gates, the package, the versioned
+  source tarball, and `SHA256SUMS`, all attached to the GitHub release
+  (`.gitattributes` keeps `packaging/aur` out of the tarball so its checksum is
+  not self-referential).
+- `packaging/aur/` holds the published AUR package — `yay -S afanctl` — plus
+  `update-aur.sh`, which points it at a new tarball and regenerates `.SRCINFO`.
+- `packaging/aur/README.md` documents the whole path: GitHub release → AUR →
+  [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs) (which
+  builds from the AUR package once a maintainer merges its addition).
 
 ### Verified
 

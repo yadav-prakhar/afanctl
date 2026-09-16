@@ -9,6 +9,7 @@
     <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.98%2B-orange.svg?logo=rust" alt="Rust 1.98+"></a>
     <a href="https://github.com/yadav-prakhar/afanctl/wiki/Hardware-Interface"><img src="https://img.shields.io/badge/platform-Arch%20Linux%20%C2%B7%20A1708-lightgrey.svg" alt="Platform: Arch Linux, MacBook Pro A1708"></a>
     <a href="https://github.com/yadav-prakhar/afanctl/wiki"><img src="https://img.shields.io/badge/docs-wiki-green.svg" alt="Documentation: wiki"></a>
+    <a href="https://github.com/yadav-prakhar/afanctl/releases"><img src="https://img.shields.io/github/v/release/yadav-prakhar/afanctl" alt="Latest release"></a>
   </p>
   <p align="center">
     <a href="https://github.com/yadav-prakhar/afanctl/wiki">📖 Wiki</a> ·
@@ -45,19 +46,28 @@ the way and lets the SMC firmware run the fan again.
 
 Full rationale and constants: [Safety Model](https://github.com/yadav-prakhar/afanctl/wiki/Safety-Model).
 
-## Quick start
+## Install
 
 ```sh
-# build the package from a checkout (does not install)
-cd packaging && makepkg
+# Arch / Omarchy — from the AUR
+yay -S afanctl
 
-# build + install (requires root)
+# or the package attached to the latest GitHub release
+gh release download --repo yadav-prakhar/afanctl --pattern 'afanctl-[0-9]*x86_64.pkg.tar.zst'
+sudo pacman -U afanctl-[0-9]*x86_64.pkg.tar.zst
+
+# or build it yourself from a checkout
 cd packaging && makepkg -si
+```
 
+```sh
 # the unit installs DISABLED and starts in observe mode — nothing changes yet
 sudo systemctl enable --now afanctl
 systemctl status afanctl
 ```
+
+Neither the package nor `systemctl enable` hands the fan over: the daemon starts
+in `observe`, writing nothing, until you ask for `curve`.
 
 ```sh
 afanctl status          # temps, t_eff, mode, fan, config provenance
@@ -144,6 +154,7 @@ sysfs trees; ordinary development **never writes to the real `/sys`**.
 | Why not mbpfan / fancontrol | [afanctl vs mbpfan](https://github.com/yadav-prakhar/afanctl/wiki/afanctl-vs-mbpfan) |
 | Requirements & build plan | `PRD.md` · `PLAN.md` · `DESIGN.md` in this repo |
 | To contribute | [CONTRIBUTING.md](CONTRIBUTING.md) |
+| To publish a release (AUR, Omarchy) | [`packaging/aur/README.md`](packaging/aur/README.md) |
 
 ## Contributing
 
