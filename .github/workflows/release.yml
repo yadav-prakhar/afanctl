@@ -1,0 +1,111 @@
+# Builds and publishes a GitHub release from a version tag.
+#
+#   git tag -a v0.1.1 -m "afanctl 0.1.1" && git push origin v0.1.1
+#
+# Produces, on the release page: the source tarball (the tagged tree without
+# packaging/aur — see .gitattributes), the built x86_64 package, and
+# SHA256SUMS. The AUR package is then pointed at the tarball with
+# packaging/aur/update-aur.sh; until that runs, the AUR copy keeps the previous
+# release's checksums and the in-tree ones lag by one release by design.
+#
+# The build runs in a clean Arch Linux container, which is where this package
+# has to work: makepkg, the test suite, and the same PKGBUILD a developer uses
+# (packaging/PKGBUILD, which builds the checkout rather than a release tarball).
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install build tooling
+        run: >
+          pacman -Syu --noconfirm --needed
+          base-devel rust git github-cli
+
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: The tag, Cargo.toml and the PKGBUILD must agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
+          pkg_version="$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
+          echo "tag=$tag cargo=$cargo_version pkgver=$pkg_version"
+          [ "$tag" = "$cargo_version" ] || { echo "::error::tag v$tag != Cargo.toml $cargo_version"; exit 1; }
+          [ "$tag" = "$pkg_version" ] || { echo "::error::tag v$tag != packaging/PKGBUILD pkgver $pkg_version"; exit 1; }
+          echo "VERSION=$tag" >> "$GITHUB_ENV"
+
+      - name: Source tarball (versioned, checksummed)
+        run: |
+          set -euo pipefail
+          git archive --format=tar.gz --prefix="afanctl-$VERSION/" \
+            -o "afanctl-$VERSION.tar.gz" "$GITHUB_REF_NAME"
+          tar -tzf "afanctl-$VERSION.tar.gz" | head -5
+          # packaging/aur is export-ignored; it must not be in here, or its
+          # checksum would have to describe a tarball containing that checksum.
+          ! tar -tzf "afanctl-$VERSION.tar.gz" | grep -q '^afanctl-.*/packaging/aur/'
+          sha256sum "afanctl-$VERSION.tar.gz" > SHA256SUMS
+
+      # makepkg refuses to run as root, so the build runs as an ordinary user.
+      - name: Build the package and run the gates
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          cp -r "$GITHUB_WORKSPACE" /home/builder/afanctl
+          chown -R builder:builder /home/builder/afanctl
+          su builder -c 'cd /home/builder/afanctl && ./check.sh'
+          su builder -c 'cd /home/builder/afanctl/packaging && makepkg --noconfirm --force'
+          # The Cargo release profile already strips, so makepkg's -debug split
+          # would ship an empty package; the release carries the one artifact.
+          find /home/builder/afanctl/packaging -maxdepth 1 \
+            -name "afanctl-$VERSION-*.pkg.tar.zst" ! -name "*-debug-*" -exec cp {} . \;
+          sha256sum afanctl-"$VERSION"-*.pkg.tar.zst >> SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" {found=1; next}
+            found && /^## / {exit}
+            found {print}
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "no CHANGELOG section for $VERSION — using generated notes" >&2
+            echo "" > notes.md
+          fi
+          cat notes.md
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          args=(release create "$GITHUB_REF_NAME"
+                --title "afanctl $VERSION"
+                --verify-tag
+                --notes-file notes.md)
+          if ! grep -q '[^[:space:]]' notes.md; then
+            args=(release create "$GITHUB_REF_NAME"
+                  --title "afanctl $VERSION"
+                  --verify-tag
+                  --generate-notes)
+          fi
+          gh "${args[@]}" \
+            "afanctl-$VERSION.tar.gz" \
+            afanctl-"$VERSION"-*.pkg.tar.zst \
+            SHA256SUMS

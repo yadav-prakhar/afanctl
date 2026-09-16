@@ -1,0 +1,6 @@
+# Packaging metadata is export-ignored so a tagged source tarball never contains
+# the AUR PKGBUILD that publishes a checksum of that very tarball (a circular
+# dependency). `packaging/aur/` is mirrored to aur.archlinux.org instead.
+packaging/aur export-ignore
+.omo export-ignore
+orchestration export-ignore

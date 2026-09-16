@@ -3,6 +3,11 @@
 # checkout; `makepkg -si` (install) is user-gated (§9.4). The unit is
 # installed disabled — nothing changes until the user enables it, and the
 # daemon starts in observe mode regardless (R9).
+#
+# This is the DEVELOPMENT PKGBUILD: it builds the working tree and is what
+# `.github/workflows/release.yml` builds the release artifact with. The
+# PUBLISHED package (the AUR one, built from a released source tarball) lives
+# in `packaging/aur/` — change both when the installed file set changes.
 pkgname=afanctl
 pkgver=0.1.0
 pkgrel=1
