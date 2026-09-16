@@ -3,10 +3,10 @@
 #   git tag -a v0.1.1 -m "afanctl 0.1.1" && git push origin v0.1.1
 #
 # Produces, on the release page: the source tarball (the tagged tree without
-# packaging/aur — see .gitattributes), the built x86_64 package, and
-# SHA256SUMS. The AUR package is then pointed at the tarball with
-# packaging/aur/update-aur.sh; until that runs, the AUR copy keeps the previous
-# release's checksums and the in-tree ones lag by one release by design.
+# packaging/aur — see .gitattributes), the built x86_64 package, install.sh,
+# and SHA256SUMS. `releases/latest/download/install.sh` is the documented
+# one-command install, and it resolves the package through SHA256SUMS, so the
+# asset names here are not part of any interface.
 #
 # The build runs in a clean Arch Linux container, which is where this package
 # has to work: makepkg, the test suite, and the same PKGBUILD a developer uses
@@ -91,6 +91,7 @@ jobs:
           awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" {found=1; next}
             found && /^## / {exit}
+            found && /^\[[^]]+\]: / {next}
             found {print}
           ' CHANGELOG.md > notes.md
           if ! grep -q '[^[:space:]]' notes.md; then
@@ -117,4 +118,5 @@ jobs:
           gh "${args[@]}" \
             "afanctl-$VERSION.tar.gz" \
             afanctl-"$VERSION"-*.pkg.tar.zst \
+            install.sh \
             SHA256SUMS
