@@ -1,6 +1,8 @@
 orchestration/logs/
 target/
 .omo/
+# agent operational state (state, logs, handoffs, plans) — never committed
+.omc/
 packaging/pkg/
 packaging/src/
 packaging/*.pkg.tar.zst

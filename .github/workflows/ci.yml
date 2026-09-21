@@ -1,0 +1,74 @@
+# The test gate. Runs on every PR into `dev` and `master`, and on pushes to
+# those branches, so that "tests pass" is a checkable fact rather than a local
+# assertion — the right footing for a project whose pitch is safety.
+#
+# The gate is `./check.sh` and nothing else. That script is the contract
+# CONTRIBUTING.md points contributors at (fmt, clippy -D warnings, the
+# expanded §8 lint pass, cargo test, and the `--features hw` skip proof), so
+# running it here keeps CI and a developer's local run from drifting apart.
+# Adding the individual cargo commands alongside it would create a second,
+# competing definition of the gate.
+#
+# Releases are NOT built here — `release.yml` is tag-driven (`on: push: tags:
+# v*`, no branch filter), so making `dev` the default branch does not affect
+# it. Tags are still cut on `master`.
+name: ci
+
+on:
+  pull_request:
+    branches: [dev, master]
+  push:
+    branches: [dev, master]
+
+# A force-push to a PR branch should not leave the previous run burning a
+# runner for a diff nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned rather than `stable` for two reasons: a floating toolchain makes
+  # clippy lint drift turn unrelated PRs red, and pinning to the declared
+  # MSRV is what actually verifies Cargo.toml's `rust-version` instead of
+  # leaving it as documentation. Bump this and Cargo.toml together.
+  MSRV: "1.98"
+  # Deliberately NOT set: AFANCTL_HWTEST. Gate 4 (`cargo test --features hw`)
+  # must SKIP here — that skip is what proves the hardware guard works. A
+  # runner has no applesmc, so the hardware check would also catch it, but
+  # the env var is the guard that must not be weakened. Never set it in CI.
+
+jobs:
+  gates:
+    name: check.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$MSRV" --profile minimal --component rustfmt,clippy
+          rustup default "$MSRV"
+          rustc --version
+          cargo clippy --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ env.MSRV }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ env.MSRV }}-
+
+      # Every test reaches sysfs through `--sysfs-root` against
+      # tests/fixtures/sysfs/, so the suite is hardware-free by construction.
+      # If a future test needs real hardware it stays behind `--features hw`
+      # plus AFANCTL_HWTEST=1 and is excluded here by both.
+      - name: Quality gates
+        run: ./check.sh
