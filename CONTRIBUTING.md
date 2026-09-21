@@ -41,10 +41,48 @@ disagreement.
   per-module `thiserror` enums whose messages name the path/key **and the fix**.
   Logging via `tracing` macros only — no `println!` outside `cli.rs`.
 
+## Branches and releases
+
+`dev` is the integration branch and the default branch. `master` is the
+published/release branch.
+
+- Cut feature branches as `<type>/<slug>` (`fix/`, `feat/`, `refactor/`,
+  `docs/`, `chore/`, `ci/`, `test/`) **off `dev`**, and merge them back into
+  `dev`.
+- `master` is updated from `dev` **only when a release is cut**. A release is
+  an ordinary `dev` -> `master` merge, then an annotated tag **on `master`**:
+
+  ```sh
+  git switch master && git merge --no-ff dev
+  git tag -a v0.1.1 -m "afanctl 0.1.1" && git push origin master v0.1.1
+  ```
+
+  Pushing the tag is what publishes: `.github/workflows/release.yml` is
+  tag-driven (`on: push: tags: v*`) and has no branch filter, so it is
+  unaffected by which branch is the default. The tag, `Cargo.toml`'s
+  `version` and `packaging/PKGBUILD`'s `pkgver` must agree — the workflow
+  refuses to publish otherwise.
+- Keeping `master` as the release branch is what leaves the AUR `PKGBUILD`,
+  the `install.sh` release flow and the `v0.1.0` tag lineage undisturbed.
+
+Both `dev` and `master` are protected: no direct pushes to `master`, and the
+`ci / check.sh` gate is a required check on both.
+
+### Why the sibling repo differs
+
+[`omafan`](https://github.com/yadav-prakhar/omafan) uses the same *branch
+flow* but **different release mechanics**, and the difference is deliberate —
+do not generalise from one repo to the other. `omarchy plugin add` clones that
+repository wholesale into a user's `~/.config/omarchy/plugins/<id>`, so its
+release is a *filtered sync* of an allowlist onto `master`, never a merge;
+shipping its `AGENTS.md` would hand a stranger's coding agent instructions
+inside their own install. Nothing clones **this** repo into a user's config
+directory, so here a plain merge is correct and sufficient.
+
 ## Workflow
 
 ```sh
-# 1. Fork, branch from master, make your change
+# 1. Fork, branch from dev (see "Branches and releases" above), make your change
 # 2. Run the full gate (all four must pass):
 ./check.sh
 # which runs:
