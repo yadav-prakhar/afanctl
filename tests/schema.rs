@@ -153,7 +153,45 @@ fn assert_status_v1(v: &serde_json::Value) {
     assert!(config["interval_s"].is_u64());
     assert!(config["source"].is_string());
 
+    // RULING F27: `status` passes the daemon's safety block through. Null when
+    // no daemon is running (or one older than this build wrote the state),
+    // otherwise the full per-layer object.
+    assert!(
+        v["safety"].is_null() || v["safety"].is_object(),
+        "safety must be the daemon block or null, got {}",
+        v["safety"]
+    );
+    if v["safety"].is_object() {
+        assert_safety_layers(&v["safety"]);
+    }
+
     assert!(v["recent_errors"].is_array(), "recent_errors array");
+}
+
+/// RULING F27: the per-backend safety block. The safety story is no longer one
+/// universal mechanism, so every layer is reported separately instead of being
+/// inferred from a single boolean.
+fn assert_safety_layers(v: &serde_json::Value) {
+    assert!(
+        v["backend"].is_string(),
+        "safety.backend names the backend + bound ABI generation"
+    );
+    for key in [
+        "l1_verify",
+        "l2_death_path",
+        "l3_watchdog_notify",
+        "hw_watchdog",
+    ] {
+        assert!(
+            v[key].is_boolean(),
+            "safety.{key} must be a boolean, got {}",
+            v[key]
+        );
+    }
+    assert!(
+        v["firmware_auto_on_suspend"].is_boolean() || v["firmware_auto_on_suspend"].is_null(),
+        "safety.firmware_auto_on_suspend is boolean|null (null = unproven for this backend)"
+    );
 }
 
 /// Assert a value matches the `afanctl.cmd.v1` schema (Appendix B, R8).
@@ -183,6 +221,7 @@ fn assert_state_v1(v: &serde_json::Value) {
         "monitor_only",
         "watchdog_pings",
         "polls",
+        "safety",
         "recent_errors",
     ] {
         assert!(v.get(key).is_some(), "state.{key} missing");
@@ -200,6 +239,7 @@ fn assert_state_v1(v: &serde_json::Value) {
         v["polls"].is_u64(),
         "RULING F22: additive completed-poll counter"
     );
+    assert_safety_layers(&v["safety"]);
     assert!(v["recent_errors"].is_array());
 }
 

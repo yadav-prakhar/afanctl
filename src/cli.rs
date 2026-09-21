@@ -465,11 +465,18 @@ fn step_once_report(
 /// The live (sysfs) half of `once`: open the backend, arm L2, run exactly one
 /// poll, then restore AUTO before returning — whatever the poll's outcome.
 fn live_once_report(config: &Config, globals: &Globals) -> Result<StepReport, CliError> {
-    let smc = SysfsSmc::open(&globals.sysfs_root).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut smc =
+        SysfsSmc::open(&globals.sysfs_root).map_err(|e| CliError::Runtime(e.to_string()))?;
     // INVARIANT: L2 armed before any control write can happen, so a crash
-    // between enter_manual and exit still writes AUTO (single `write(b"0")`).
-    if let Some(fd) = smc.panic_fd() {
-        crate::safety::install_death_path(fd);
+    // between enter_manual and exit still restores the firmware in a single
+    // `write(2)`. RULING F27: the descriptor is armed only once the arm-time
+    // probe has proven it; an unprovable restore is reported absent, loudly,
+    // rather than armed and silently useless.
+    match smc.probe_safe_restore() {
+        Ok(restore) => crate::safety::install_death_path(restore),
+        Err(e) => tracing::error!(
+            "L2 death path ABSENT for `once`: the arm-time restore probe failed: {e} (fix: run as root)"
+        ),
     }
     let step = build_supervisor_with(Box::new(smc), config, RunMode::Curve, &globals.config)
         .map(|mut supervisor| supervisor.step_once());
@@ -478,7 +485,7 @@ fn live_once_report(config: &Config, globals: &Globals) -> Result<StepReport, Cl
             restore_auto_on_exit(&globals.sysfs_root)?;
             report
                 .notes
-                .push("exit: AUTO restored (fan1_manual=0)".to_string());
+                .push("exit: AUTO restored (fan mode verified Auto)".to_string());
             Ok(report)
         }
         Err(e) => {
@@ -499,8 +506,8 @@ fn restore_auto_on_exit(root: &std::path::Path) -> Result<(), CliError> {
     let mut smc = SysfsSmc::open(root).map_err(|e| CliError::Runtime(e.to_string()))?;
     smc.set_mode(FanMode::Auto).map_err(|e| {
         CliError::Runtime(format!(
-            "once exit restore: set AUTO on fan1_manual failed: {e} (fix: check \
-             fan1_manual writability; the fan may remain in manual — run `afanctl doctor` as root)"
+            "once exit restore: set AUTO failed: {e} (fix: check the fan mode \
+             attribute's writability; the fan may remain in manual — run `afanctl doctor` as root)"
         ))
     })?;
     Ok(())
@@ -591,19 +598,26 @@ fn run_doctor(json: bool, roundtrip: bool, compare_secs: Option<u64>, globals: &
 
 /// Hidden L2 probe (R4; supervised gate §9.3c): arm the death path against the
 /// `--sysfs-root` backend, then panic deliberately — the installed hook writes
-/// `b"0"` (AUTO) before unwinding. Exits nonzero by design.
+/// the bound generation's AUTO token before unwinding. Exits nonzero by
+/// design. RULING F27: it goes through the same arm-time probe the daemon
+/// uses, so this verb proves the whole path end to end per backend fixture.
 fn run_selftest_panic(globals: &Globals) -> i32 {
-    let smc = SysfsSmc::open(&globals.sysfs_root).ok();
-    if let Some(fd) = smc.as_ref().and_then(|s| s.panic_fd()) {
-        crate::safety::install_death_path(fd);
+    let mut smc = SysfsSmc::open(&globals.sysfs_root).ok();
+    match smc.as_mut().map(SysfsSmc::probe_safe_restore) {
+        Some(Ok(restore)) => crate::safety::install_death_path(restore),
+        Some(Err(e)) => tracing::error!(
+            "selftest-panic: L2 death path ABSENT — the arm-time restore probe failed: {e}"
+        ),
+        None => tracing::error!("selftest-panic: no backend; L2 death path ABSENT"),
     }
     // INVARIANT (fd lifetime): the panic hook runs before unwinding drops
-    // `smc`, so the pre-opened fan1_manual fd is still open when it writes AUTO.
+    // `smc`, so the pre-opened mode-attribute fd is still open when it writes.
     crate::safety::arm_test_panic()
 }
 
 /// `hold`: clamp/reject the requested rpm against the hardware band read at
-/// discovery (`fan1_min`/`fan1_max` via `SysfsSmc::open`, PRD R5/Q2) BEFORE
+/// discovery (`fan1_min`/`fan1_max` via `SysfsSmc::open`, PRD R5/Q2 — both
+/// names survived the ABI conversion) BEFORE
 /// writing `cmd.json`. Below `fan1_min` is rejected with exit 1 (a fan cannot
 /// spin slower than its hardware floor); above `fan1_max` is clamped down.
 fn run_hold(rpm: u32, globals: &Globals) -> i32 {
@@ -738,6 +752,12 @@ fn status_json(d: &StatusData) -> serde_json::Value {
         "effective": {"temp_c": d.t_eff.map_or(serde_json::Value::Null, temp), "method": "max"},
         "fan": {"rpm": d.fan.rpm, "min_rpm": d.hw_min, "max_rpm": d.hw_max, "target_rpm": field("target_rpm").cloned().unwrap_or(serde_json::Value::Null), "manual": d.fan.mode == FanMode::Manual},
         "config": {"high_c": d.config.high_c, "max_c": d.config.max_c, "min_rpm": d.config.min_rpm, "max_rpm": d.config.max_rpm, "interval_s": d.config.interval_s, "source": d.source},
+        // RULING F27 (additive): the daemon publishes which safety layers are
+        // actually armed for its backend; `status` passes the block through
+        // verbatim rather than re-deriving a story it cannot observe. `null`
+        // when no daemon is running, or when one older than this build wrote
+        // the state file.
+        "safety": field("safety").cloned().unwrap_or(serde_json::Value::Null),
         "recent_errors": field("recent_errors").cloned().unwrap_or(serde_json::Value::Array(Vec::new())),
     })
 }
@@ -755,6 +775,33 @@ fn run_status(json: bool, globals: &Globals) -> i32 {
     }
     print!("{}", status_human(&d));
     0
+}
+
+/// RULING F27: render the daemon-published safety block. `unknown` when no
+/// daemon state is published, or when a daemon older than this build wrote it:
+/// `status` reads sysfs read-only and cannot observe another process's armed
+/// layers, so absence of evidence is reported as such, never guessed at.
+fn safety_line(d: &StatusData) -> String {
+    let Some(safety) = d.state_field("safety") else {
+        return "unknown (no daemon safety block published)".to_owned();
+    };
+    let flag = |key: &str| match safety.get(key).and_then(serde_json::Value::as_bool) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    };
+    format!(
+        "backend={} l1_verify={} l2_death_path={} l3_watchdog_notify={} hw_watchdog={} firmware_auto_on_suspend={}",
+        safety
+            .get("backend")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown"),
+        flag("l1_verify"),
+        flag("l2_death_path"),
+        flag("l3_watchdog_notify"),
+        flag("hw_watchdog"),
+        flag("firmware_auto_on_suspend"),
+    )
 }
 
 /// Human status summary (one line per fact); `temp_c` already carries the
@@ -781,6 +828,9 @@ fn status_human(d: &StatusData) -> String {
     if d.auto_restore_pending() {
         out.push_str("auto_restore_pending: true (AUTO restore pending)\n");
     }
+    // RULING F27: one line naming the backend and each layer, because the
+    // safety story is per-backend now and a single boolean cannot carry it.
+    out.push_str(&format!("safety: {}\n", safety_line(d)));
     for sensor in &d.sensors {
         let reading = sensor
             .milli_c

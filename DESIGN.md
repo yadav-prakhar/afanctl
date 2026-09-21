@@ -35,8 +35,19 @@ pub struct MilliC(pub i32);
 impl MilliC { pub fn from_c(c: i32) -> Self; pub fn as_c(&self) -> i32 /* rounded */ }
 
 // ---- smc.rs — the ONLY module that knows a sysfs path
+/// RULING F26 (2026-09-21): logical mode only. The *token* written and read back is resolved
+/// from the bound applesmc ABI generation, never hardcoded: legacy spells Auto `0`, modern
+/// spells it `2` and rejects `0` with `-EINVAL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FanMode { Auto, Manual }
+/// RULING F26: which applesmc attribute generation `open()` bound, detected by probing for the
+/// mode attribute — never by parsing a kernel version. Legacy (<= 7.2): `fan1_output` +
+/// `fan1_manual`, Auto = `0`. Modern (>= 7.3, commit 94f5081d): `fan1_target` + `pwm1_enable`,
+/// Manual = `1`, Auto = `2`, `fan1_max` read-only, no `pwm1`. A tree exposing both mode
+/// attributes is refused, not guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbiGeneration { Legacy, Modern }
+impl AbiGeneration { pub fn token(self) -> &'static str; }
 #[derive(Debug, Clone)]
 pub struct FanState { pub rpm: u32, pub mode: FanMode }
 #[derive(Debug, Clone)]
@@ -72,13 +83,35 @@ pub trait Smc: Send {
     fn write_speed(&mut self, rpm: u32) -> Result<u32, SmcError>;
     /// Write + read-back-verify. Returns the verified mode.
     fn set_mode(&mut self, mode: FanMode) -> Result<FanMode, SmcError>;
-    /// Pre-opened O_WRONLY fd on the manual file for the L2 death path (None if backend is a mock without one).
-    fn panic_fd(&self) -> Option<i32>;
+    /// RULING F27 (2026-09-21): the L2 death-path descriptor — the pre-opened O_WRONLY fd on the
+    /// attribute that returns control to the firmware, plus the exact `'static` bytes that do it.
+    /// `None` when the backend has no such fd (read-only tree, or a mock without one). Presence is
+    /// NOT proof; see `probe_safe_restore`. Replaces `panic_fd() -> Option<i32>`.
+    fn safe_restore(&self) -> Option<SafeRestore>;
+    /// RULING F27 arm-time probe: one real write of the restore bytes through the very fd the
+    /// signal handler will use, then a verified read-back proving the hardware reports firmware
+    /// control. `Err` means L2 must be reported **absent**, never armed — L2 ignores write errors
+    /// by design, so an unproven path would advertise a layer that does nothing.
+    fn probe_safe_restore(&mut self) -> Result<SafeRestore, SmcError>;
+    /// RULING F27: safety layers beyond L1/L2 this backend can offer, for the status/state block.
+    fn safety_capabilities(&self) -> SafetyCapabilities;
 }
 pub struct SysfsSmc { /* … */ }
-impl SysfsSmc { pub fn open(root: &std::path::Path) -> Result<Self, SmcError>; }
+impl SysfsSmc {
+    pub fn open(root: &std::path::Path) -> Result<Self, SmcError>;
+    pub fn layout_changed(&self) -> bool;                 // ruling T3 N2
+    /// RULING F26: the bound generation, and its human evidence line for `doctor` (assembled from
+    /// the one per-generation table, so R1 keeps attribute names inside `smc.rs`).
+    pub fn abi_generation(&self) -> AbiGeneration;
+    pub fn abi_evidence(&self) -> String;
+}
 pub struct MockSmc { /* … */ }   // scriptable: injectable faults, drift, latency
-impl MockSmc { pub fn new(hw_min: u32, hw_max: u32) -> Self; /* + fault injection setters */ }
+impl MockSmc {
+    pub fn new(hw_min: u32, hw_max: u32) -> Self;         /* + fault injection setters */
+    /// RULING F27: give the mock an L2 descriptor (a writable stand-in file + its `'static`
+    /// bytes) so the descriptor and its arm-time probe are testable without hardware.
+    pub fn set_safe_restore(&mut self, file: std::fs::File, bytes: &'static [u8]);
+}
 
 // ---- config.rs
 #[derive(Debug, Clone)]
@@ -166,16 +199,49 @@ impl Supervisor {
     /// `Auto`. Rationale: a SIGKILL/OOM-kill cannot run L2, so the *restart* is what restores
     /// AUTO within ~1 s; PRD §9.3e's "L2 already restored AUTO" names a mechanism that is
     /// impossible for an uncatchable signal, while its property remains the acceptance bar.
+    /// RULING F27 (orchestrator, 2026-09-21): the order gains the arm-time probe — read the
+    /// inherited fan mode → `probe_safe_restore()` → arm L2 only on success (else log `L2 death
+    /// path ABSENT` and degrade to observe) → reconcile with the *pre-probe* snapshot → READY.
+    /// The inherited mode must be sampled before the probe, because the probe's own fail-safe
+    /// write would otherwise erase the evidence that a predecessor died owning the fan. R3 is
+    /// read as "observe issues no *control* write": the probe writes only the fail-safe value.
     pub fn run(&mut self) -> !;
 }
 // RULING F18 (A4, N-F14-1): `config_source` is the resolved global `--config`
 // path, populated by `cli.rs`, so the startup evidence line can log it.
 pub struct RuntimePaths { pub cmd: std::path::PathBuf, pub state: std::path::PathBuf, pub config_source: std::path::PathBuf }
 
-// ---- safety.rs — the ONLY module allowed `unsafe`
-/// Pre-open fd + install panic hook and raw SIGSEGV/SIGABRT/SIGTERM/SIGINT handlers that
-/// write b"0" (AUTO) to the fan manual file in a single write(2). Async-signal-safe only.
-pub fn install_death_path(panic_fd: i32);
+// ---- safety.rs — the ONLY module allowed `unsafe`; names NO attribute and NO restore value
+/// RULING F27 (2026-09-21): everything the async-signal-safe death path needs, resolved up front
+/// by the backend. `bytes` is `'static` — a per-backend constant slice, never heap or formatted —
+/// so the handler never touches the allocator; a multi-byte restore ("level auto") is still one
+/// write(2) and its length is part of the descriptor. A negative fd is the disarmed descriptor.
+#[derive(Debug, Clone, Copy)]
+pub struct SafeRestore { /* fd: RawFd, bytes: &'static [u8] */ }
+impl SafeRestore {
+    pub fn new(fd: std::os::fd::RawFd, bytes: &'static [u8]) -> Self;
+    pub fn fd(&self) -> std::os::fd::RawFd;
+    pub fn bytes(&self) -> &'static [u8];
+}
+/// RULING F27: safety layers a backend offers beyond L1/L2, for the status/state safety block.
+/// `firmware_auto_on_suspend: None` = unproven for this backend; never asserted without evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SafetyCapabilities {
+    pub backend: &'static str,            // e.g. "applesmc/modern" — names no attribute (R1)
+    pub hw_watchdog: bool,                // a firmware/EC watchdog that survives SIGKILL
+    pub firmware_auto_on_suspend: Option<bool>,
+}
+/// Arm the death path with a backend-supplied descriptor + install the panic hook and raw
+/// SIGSEGV/SIGABRT/SIGTERM/SIGINT handlers, which write its bytes to its fd in a single write(2).
+/// Async-signal-safe only: ONE lock-free atomic load (the descriptor lives in leaked `'static`
+/// storage published at arm time, so fd+ptr+len arrive together — no torn multi-atomic read),
+/// one write(2), no allocation, no formatting, no locks, no path construction.
+/// The caller must have proven the restore first (`Smc::probe_safe_restore`).
+/// Replaces `install_death_path(panic_fd: i32)`.
+pub fn install_death_path(restore: SafeRestore);
+/// RULING F27: true when a *usable* descriptor is armed — the single source of truth for "L2
+/// really will write on death", whoever armed it. One lock-free atomic load.
+pub fn is_armed() -> bool;
 /// Deliberate panic for `selftest-panic` (proves L2; verified by fixture/hw tests).
 pub fn arm_test_panic() -> !;
 
@@ -203,9 +269,18 @@ pub fn sd_status(msg: &str) -> bool;   // STATUS=…
   "fan": { "rpm": 1203, "min_rpm": 1200, "max_rpm": 7200, "target_rpm": 1200, "manual": false },
   "config": { "high_c": 66, "max_c": 86, "min_rpm": 1200, "max_rpm": 6200, "interval_s": 1,
               "source": "/etc/afanctl/afanctl.toml" },
+  "safety": { "backend": "applesmc/modern", "l1_verify": true, "l2_death_path": true,
+              "l3_watchdog_notify": true, "hw_watchdog": false,
+              "firmware_auto_on_suspend": null },
   "recent_errors": [ { "ts": "2026-09-14T15:02:11+05:30", "msg": "…" } ]
 }
 ```
+RULING F27 (additive; schema id stays `v1`, the F18/F20/F22 precedent): `safety` reports which
+layers are **actually armed**, per backend, instead of a single boolean the plugin had to infer.
+`l2_death_path` comes from `safety::is_armed()`. `firmware_auto_on_suspend` is `boolean|null`,
+`null` meaning unproven for this backend (applesmc today). In `status --json` the whole object is
+`null` when no daemon state is published — `status` reads sysfs read-only and cannot observe
+another process's armed layers, so absence of evidence is reported as such, never guessed at.
 `afanctl.cmd.v1` (`/run/afanctl/cmd.json`, atomic tmp+rename, written by CLI verbs):
 ```json
 { "schema": "afanctl.cmd.v1", "mode": "hold", "rpm": 3000 }
@@ -215,12 +290,19 @@ pub fn sd_status(msg: &str) -> bool;   // STATUS=…
 { "schema": "afanctl.state.v1", "ts": "…", "mode": "curve", "t_eff_c": 71.2,
   "target_rpm": 3400, "last_written_rpm": 3350, "actual_rpm": 3390,
   "verified": true, "monitor_only": false, "auto_restore_pending": false, "polls": 981,
-  "watchdog_pings": 1962, "recent_errors": [ … last 5 … ] }
+  "watchdog_pings": 1962,
+  "safety": { "backend": "applesmc/modern", "l1_verify": true, "l2_death_path": true,
+              "l3_watchdog_notify": true, "hw_watchdog": false,
+              "firmware_auto_on_suspend": null },
+  "recent_errors": [ … last 5 … ] }
 ```
 
 ### Appendix C — doctor output (human; `--json` reuses the same fields)
 
-Checklist lines `PASS|FAIL|WARN — <check> — <detail>` covering R5's list, then (if `--compare N`) a table: per-sample `t_eff`, SMC rpm, our simulated target, delta; summary stats (mean/max delta, samples where ours is quieter/louder); one-line verdict guidance. Exit 1 if any FAIL.
+RULING F26: check **names** are a public contract and stay generation-neutral — the bound ABI
+generation appears in the *details*, plus one additive check, `applesmc ABI generation`, whose
+detail string is built inside `smc.rs` (R1). Checklist lines
+`PASS|FAIL|WARN — <check> — <detail>` covering R5's list, then (if `--compare N`) a table: per-sample `t_eff`, SMC rpm, our simulated target, delta; summary stats (mean/max delta, samples where ours is quieter/louder); one-line verdict guidance. Exit 1 if any FAIL.
 
 ### Appendix D — `packaging/afanctl.service`
 

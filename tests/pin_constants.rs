@@ -165,8 +165,16 @@ impl Smc for SharedMock {
     fn set_mode(&mut self, mode: FanMode) -> Result<afanctl::smc::FanMode, afanctl::smc::SmcError> {
         self.smc().set_mode(mode)
     }
-    fn panic_fd(&self) -> Option<i32> {
-        self.smc().panic_fd()
+    fn safe_restore(&self) -> Option<afanctl::safety::SafeRestore> {
+        self.smc().safe_restore()
+    }
+    fn probe_safe_restore(
+        &mut self,
+    ) -> Result<afanctl::safety::SafeRestore, afanctl::smc::SmcError> {
+        self.smc().probe_safe_restore()
+    }
+    fn safety_capabilities(&self) -> afanctl::safety::SafetyCapabilities {
+        self.smc().safety_capabilities()
     }
 }
 
