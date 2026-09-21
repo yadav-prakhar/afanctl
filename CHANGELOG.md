@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **applesmc ABI break on kernel >= 7.3 (#2).** Kernel commit `94f5081d`
+  ("hwmon: (applesmc) Convert to `hwmon_device_register_with_info`", released
+  in 7.3) renamed `fanX_output` → `fanX_target` and `fanX_manual` →
+  `pwmX_enable` with **no back-compat aliasing**, so afanctl failed to start on
+  7.3+ (`open()` on `fan1_manual` returns `ENOENT`). afanctl now supports
+  **both attribute generations in one binary** and binds one at startup by
+  probing for the files — never by parsing a kernel version. The mode
+  vocabulary is mapped per generation: legacy `Manual=1 / Auto=0`, modern
+  `Manual=1 / Auto=2` (modern rejects `0` with `-EINVAL`). `fan1_max` being
+  read-only on the modern ABI is handled — it was only ever read. A machine
+  exposing both mode attributes is refused rather than guessed at, because the
+  AUTO tokens are mutually incompatible. `doctor` reports the bound generation
+  in an additive `applesmc ABI generation` check; existing check names are
+  unchanged. (RULING F26)
+
+### Changed
+
+- **The L2 death path is now a per-backend descriptor, proven at arm time
+  (#3).** `safety.rs` no longer holds a compile-time restore byte and now
+  contains **no attribute name and no restore value**: the backend supplies a
+  `SafeRestore { fd, bytes: &'static [u8] }` and `safety.rs` merely consumes
+  it. This is what makes the ABI fix safe — the naive port, renaming the path
+  while keeping the byte `b"0"`, would have been *more* dangerous than the
+  startup failure, since applesmc >= 7.3 rejects `0` and L2 ignores write
+  errors by design, leaving the fan pinned in manual with no supervisor alive.
+  The async-signal-safe handler contract is unchanged: one lock-free atomic
+  load, one `write(2)`, no allocation, formatting, locks or path construction;
+  a multi-byte restore is still a single `write(2)` with the length carried in
+  the descriptor. Before advertising L2, the daemon now performs a real write
+  of the restore bytes through the very fd the handler will use and verifies
+  the hardware reports firmware control; an unprovable restore is reported
+  **L2 absent, loudly** and afanctl refuses every control mode rather than
+  arming a broken path. `Smc::panic_fd` is replaced by `safe_restore`,
+  `probe_safe_restore` and `safety_capabilities`. (RULING F27)
+- `status --json` and `state.json` gained an additive `safety` object
+  reporting which layers are **actually armed** — `backend` (with the bound ABI
+  generation), `l1_verify`, `l2_death_path`, `l3_watchdog_notify`,
+  `hw_watchdog`, `firmware_auto_on_suspend` — instead of a single boolean the
+  plugin had to infer from. Schema ids stay `afanctl.status.v1` /
+  `afanctl.state.v1`. `firmware_auto_on_suspend` is `null` for applesmc: no
+  evidence either way, and `false` would be a claim. (RULING F27)
+- Log and error messages in `supervisor.rs` / `cli.rs` now describe the
+  *logical* fan mode instead of naming `fan1_manual`, which is wrong on half
+  the installed base; the real attribute path still reaches the user via
+  `SmcError`, generation-correctly. `doctor` check names are unchanged — they
+  are a public contract. (RULING F26)
+
+### Added
+
+- `tests/fixtures/sysfs/modern/` — a full kernel >= 7.3 fixture tree, so both
+  generations are covered end to end: per-generation restore bytes, a
+  regression guard proving the legacy AUTO byte is **rejected** by a modern
+  tree, a backend whose arm-time probe fails not arming, `selftest-panic` per
+  generation, and a modern-ABI daemon round trip through L2.
+- `docs/SAFETY.md` — the per-backend safety model and the supported kernel
+  range per ABI generation.
+
 ## [0.1.0] - 2026-09-16
 
 ### Added
