@@ -59,12 +59,23 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The canonical (legacy, kernel <= 7.2) tree.
     fn new() -> Self {
+        Self::of("")
+    }
+
+    /// A copy of any fixture variant's `devices/` tree. RULING F26: `"modern"`
+    /// is the kernel >= 7.3 attribute set (`pwm1_enable` + `fan1_target`), so
+    /// the end-to-end verbs can be proven against BOTH generations.
+    fn of(variant: &str) -> Self {
         let dir = unique_dir("fix");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).expect("fixture root");
         copy_tree(
-            &repo_root().join("tests/fixtures/sysfs/devices"),
+            &repo_root()
+                .join("tests/fixtures/sysfs")
+                .join(variant)
+                .join("devices"),
             &root.join("devices"),
         );
         Self { dir, root }
@@ -438,6 +449,133 @@ fn selftest_panic_exits_nonzero_and_restores_auto() {
         "0",
         "the L2 panic hook wrote b\"0\" (AUTO)"
     );
+}
+
+/// Issue #2 + #3 end to end on the **modern** ABI: the daemon binds
+/// `pwm1_enable` + `fan1_target`, takes control with the modern Manual token
+/// `1`, and the L2 SIGTERM path restores the modern AUTO token `2`.
+///
+/// This is the test the naive port of issue #2 fails: renaming the path while
+/// keeping the byte `b"0"` would leave `pwm1_enable` at `1` here (real
+/// applesmc answers `-EINVAL`, L2 ignores write errors by design), i.e. a fan
+/// pinned in manual with no supervisor alive.
+#[test]
+fn modern_abi_daemon_takes_control_and_l2_restores_auto_token_2() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::of("modern");
+    let cfg = config(&run_dir, 10); // one long poll, as in the legacy sibling
+
+    let hold = run(
+        &run_dir,
+        &[
+            "hold",
+            "1300",
+            "--sysfs-root",
+            fixture.root.to_str().expect("utf8 root"),
+        ],
+    );
+    assert!(hold.status.success(), "hold must exit 0: {}", stderr(&hold));
+    assert_eq!(
+        fixture.read("pwm1_enable"),
+        "2",
+        "the CLI never touches sysfs; modern AUTO stays 2"
+    );
+
+    let mut daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "observe");
+    let applied = wait_until(
+        || state_mode(&run_dir).as_deref() == Some("hold"),
+        Duration::from_secs(5),
+    );
+    if !applied {
+        let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+        panic!("modern daemon never applied the queued hold; daemon log:\n{log}");
+    }
+    assert_eq!(fixture.read("pwm1_enable"), "1", "modern Manual token is 1");
+    assert_eq!(
+        fixture.read("fan1_target"),
+        "1300",
+        "modern actuator is fan1_target, not fan1_output"
+    );
+    assert!(
+        !fixture.fan("fan1_output").exists(),
+        "the modern tree has no fan1_output; nothing may create one"
+    );
+
+    // RULING F27: the published safety block names the bound generation and
+    // reports L2 as really armed (the arm-time probe passed).
+    let state = state_json(&run_dir).expect("state.json");
+    assert_eq!(state["safety"]["backend"], "applesmc/modern");
+    assert_eq!(state["safety"]["l2_death_path"], true);
+
+    assert!(daemon.term_and_wait(), "daemon must exit on SIGTERM");
+    assert_eq!(
+        fixture.read("pwm1_enable"),
+        "2",
+        "L2 must restore the MODERN auto token 2 — writing 0 here is -EINVAL"
+    );
+}
+
+/// `selftest-panic` proves the real L2 path per backend fixture (issue #3):
+/// the bound generation's own AUTO token is what the panic hook writes.
+#[test]
+fn selftest_panic_restores_the_bound_generations_auto_token() {
+    for (variant, mode_attr, manual, auto) in [
+        ("", "fan1_manual", "1", "0"),
+        ("modern", "pwm1_enable", "1", "2"),
+    ] {
+        let run_dir = RunDir::new();
+        let fixture = Fixture::of(variant);
+        // Start in Manual so the restored token is evidence, not a coincidence.
+        fixture.write(mode_attr, manual);
+        let out = run(
+            &run_dir,
+            &[
+                "selftest-panic",
+                "--sysfs-root",
+                fixture.root.to_str().expect("utf8 root"),
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "{variant}: the deliberate panic exits nonzero"
+        );
+        assert_eq!(
+            fixture.read(mode_attr),
+            auto,
+            "{variant}: the L2 panic hook must write this generation's AUTO token"
+        );
+    }
+}
+
+/// RULING F27: a backend whose arm-time restore probe cannot pass does NOT
+/// arm L2 — and, having no trustworthy net, refuses to enter control. The
+/// mode attribute is made unwritable, so the probe fails at the write.
+#[test]
+fn daemon_whose_arm_probe_fails_does_not_arm_l2_and_refuses_control() {
+    let run_dir = RunDir::new();
+    let fixture = Fixture::of("modern");
+    let cfg = config(&run_dir, 1);
+    make_unwritable(&fixture.fan("pwm1_enable"));
+
+    let mut daemon = Daemon::spawn(&run_dir, &fixture, &cfg, "curve");
+    let published = wait_until(|| state_json(&run_dir).is_some(), Duration::from_secs(5));
+    let log = std::fs::read_to_string(run_dir.log()).unwrap_or_default();
+    assert!(published, "daemon never published state; log:\n{log}");
+    let state = state_json(&run_dir).expect("state.json");
+
+    assert_eq!(
+        state["safety"]["l2_death_path"], false,
+        "an unprovable restore must NOT be advertised as armed; state: {state}"
+    );
+    assert!(
+        log.contains("L2 death path ABSENT"),
+        "the absence must be reported loudly; log:\n{log}"
+    );
+    assert_eq!(
+        state["mode"], "observe",
+        "no control mode without a proven L2 (R4); state: {state}"
+    );
+    let _ = daemon.term_and_wait();
 }
 
 /// L1 re-asserts manual mode after induced drift (R4), with no operator help.

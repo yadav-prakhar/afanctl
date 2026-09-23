@@ -11,10 +11,15 @@
 //! state commits only on verified results; `WRITE_FAIL_FALLBACK` consecutive
 //! failed writes/re-asserts → restore AUTO + latched monitor-only, logged
 //! loudly; the cmd file re-validates each poll (invalid → ignore, keep the
-//! previous mode); observe never writes `fan1_manual`/`fan1_output`.
+//! previous mode); observe issues no control write.
+//!
+//! RULING F26: this module names no sysfs attribute. Attribute names differ
+//! per applesmc ABI generation, so a log line that hardcodes one is wrong on
+//! half the installed base; these messages describe the *logical* fan mode
+//! instead, and `SmcError` names the actual path when a write fails.
 
 /// Daemon run modes (PRD R3). Observe is always the startup default and
-/// never writes `fan1_manual`/`fan1_output`.
+/// issues no control write (no mode change to Manual, no rpm target).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunMode {
     Observe,
@@ -41,6 +46,7 @@ use crate::policy::{
     Controller, Decision, MilliC, AUTO_RETRY_LOG_POLLS, OFF_TARGET_WARN_POLLS, STALL_POLLS,
     STALL_TACH_EPSILON_RPM, VERIFY_TOLERANCE_RPM, WRITE_FAIL_FALLBACK,
 };
+use crate::safety::SafetyCapabilities;
 use crate::smc::{FanMode, Smc};
 
 /// Errors surfaced by the supervisor (per-module thiserror enum, §7).
@@ -71,7 +77,7 @@ pub struct Supervisor {
     /// Latched degradation after fallback: all writes suppressed, acts like
     /// observe, cleared only by re-commanding curve/hold (R4).
     monitor_only: bool,
-    /// We currently own the fan (`fan1_manual` = 1, verified).
+    /// We currently own the fan (mode verified Manual).
     manual_armed: bool,
     /// RULING F20 (R2): a fallback whose own AUTO restore failed still owns
     /// the fan; the poll loop re-attempts `set_mode(Auto)` until verified.
@@ -95,7 +101,8 @@ pub struct Supervisor {
     /// dwell WARN repeats every `OFF_TARGET_WARN_POLLS` polls while the
     /// excursion persists; it resets only on convergence or degradation.
     off_target_polls: u32,
-    /// RULING F20 (R3): set by `run()` when `panic_fd()` was absent — the
+    /// RULING F20 (R3)/F27: set by `run()` when the arm-time restore probe
+    /// did not pass — the
     /// "no L2 → observe" invariant then also gates `apply_mode`'s re-arm, so
     /// a cmd file cannot defeat the startup guard on either channel.
     l2_absent: bool,
@@ -112,6 +119,9 @@ pub struct Supervisor {
     /// trail; `polls` is the uptime source for `status --json`.
     polls: u64,
     paths: RuntimePaths,
+    /// RULING F27: the backend's declared safety capabilities, read once at
+    /// construction (they are a property of the bound backend, not of a poll).
+    capabilities: SafetyCapabilities,
     /// Last 5 errors for `state.json` / `status` (R7 recent_errors).
     recent_errors: Vec<RecentError>,
 }
@@ -145,7 +155,34 @@ struct StateFile<'a> {
     /// RULING F22 (additive): completed polls since daemon start, one per
     /// `step_once`. Never conflate with `watchdog_pings` (two per poll, L3).
     polls: u64,
+    /// RULING F27 (additive): which safety layers are ACTUALLY armed for this
+    /// backend, instead of the single boolean the plugin had to infer.
+    safety: SafetyLayers,
     recent_errors: &'a [RecentError],
+}
+
+/// RULING F27: the per-backend safety story, published every poll. The safety
+/// model is no longer one universal mechanism, so `state.json` reports each
+/// layer separately. Schema id stays `afanctl.state.v1` — additive fields, on
+/// the F18/F20/F22 precedent.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+struct SafetyLayers {
+    /// Backend id including the bound ABI generation (e.g. `applesmc/modern`).
+    backend: &'static str,
+    /// L1: per-poll verified writes + re-assert. Off once monitor-only latches.
+    l1_verify: bool,
+    /// L2: the arm-time-proven death path. Read from `safety::is_armed()`, the
+    /// single truth for "a usable descriptor is installed" — never from an
+    /// intention recorded somewhere else.
+    l2_death_path: bool,
+    /// L3: the systemd watchdog notification path is live (`$NOTIFY_SOCKET`
+    /// present). A presence check only — never a side-effecting ping.
+    l3_watchdog_notify: bool,
+    /// A firmware/EC watchdog that survives `SIGKILL`. applesmc has none.
+    hw_watchdog: bool,
+    /// Firmware returns the fan to auto across suspend; `null` = unproven for
+    /// this backend (never asserted without evidence).
+    firmware_auto_on_suspend: Option<bool>,
 }
 
 /// The Appendex B `afanctl.state.v1` schema id.
@@ -165,6 +202,7 @@ impl Supervisor {
         paths: &RuntimePaths,
     ) -> Result<Self, SupError> {
         let hw = (smc.hw_min_rpm(), smc.hw_max_rpm());
+        let capabilities = smc.safety_capabilities();
         cfg.config.validate(hw)?;
         let start = match start {
             // INVARIANT: a commanded hold is always within the hardware band.
@@ -199,6 +237,7 @@ impl Supervisor {
                 state: paths.state.clone(),
                 config_source: paths.config_source.clone(),
             },
+            capabilities,
             recent_errors: Vec::new(),
         })
     }
@@ -267,24 +306,47 @@ impl Supervisor {
         // RULING F22: uptime counts from this daemon's start, so the
         // completed-poll counter begins at 0 here (never loaded from disk).
         self.polls = 0;
+        // RULING F27: snapshot the inherited fan mode BEFORE the arm-time
+        // probe, because the probe itself writes the AUTO token. The reconcile
+        // verdict must be about the state this daemon inherited from its
+        // predecessor, not the state the probe created.
+        let inherited = self.smc.read_fan().map(|fan| fan.mode);
+        // RULING F27 arm-time probe: one real write of the restore bytes
+        // through the very fd and with the very bytes the handler will use,
+        // then a verified read-back. Only a PROVEN restore arms L2; an
+        // unprovable one is reported absent, loudly, because L2 ignores write
+        // errors by design and would otherwise advertise a layer that does
+        // nothing. The probe writes only the fail-safe value, so it is
+        // permitted in every mode including observe (R3 forbids *control*
+        // writes, and this can only move the fan toward firmware control).
+        let l2_armed = match self.smc.probe_safe_restore() {
+            Ok(restore) => {
+                // INVARIANT: L2 armed before any control write can happen.
+                crate::safety::install_death_path(restore);
+                true
+            }
+            Err(e) => {
+                let msg = format!(
+                    "L2 death path ABSENT: the arm-time restore probe failed: {e} (fix: run as root so the fan mode attribute is writable, then check `afanctl doctor`); refusing to arm an unproven restore, so no control mode will be entered"
+                );
+                tracing::error!("{msg}");
+                self.note_recent(msg);
+                false
+            }
+        };
         // RULING F20 (R3): record the L2 prerequisite on the supervisor itself
         // so `apply_mode` upholds the invariant on the cmd-file channel too.
-        self.l2_absent = self.smc.panic_fd().is_none();
+        self.l2_absent = !l2_armed;
         if self.mode != RunMode::Observe && self.l2_absent {
             tracing::error!(
                 "L2 death path unavailable; degrading startup mode to observe (R4: no control without a trustworthy safety net)"
             );
             self.mode = RunMode::Observe;
         }
-        let l2_armed = self.smc.panic_fd().is_some();
-        if let Some(fd) = self.smc.panic_fd() {
-            // INVARIANT: L2 armed before any control write can happen.
-            crate::safety::install_death_path(fd);
-        }
         // RULING F14: reconcile BEFORE sd_status/READY — the SIGKILL restart
         // is the mechanism that actually restores AUTO (an uncatchable signal
         // cannot run L2), and it must complete before systemd marks us ready.
-        self.reconcile_stale_state();
+        self.reconcile_stale_state(inherited);
         self.startup_evidence_line(l2_armed);
         let _ = crate::notify::sd_status(&format!("mode={}", mode_name(&self.mode)));
         let _ = crate::notify::sd_ready();
@@ -304,16 +366,19 @@ impl Supervisor {
 
     /// Startup reconcile (RULING F14 / PRD R4 fail-toward-AUTO): a SIGKILLed
     /// (or OOM-killed) predecessor cannot run L2, so the process may come up
-    /// with `fan1_manual == 1` and no safety net behind it. Read the fan:
+    /// owning the fan in Manual with no safety net behind it. `inherited` is
+    /// the mode read at the very top of `run()` — RULING F27 requires it to be
+    /// sampled BEFORE the arm-time probe, whose fail-safe write would
+    /// otherwise erase the evidence that a predecessor died owning the fan.
     /// `Manual` ⇒ log loudly, restore AUTO on the verified write path, and
     /// record it for `status --json` / the plugin. A failed restore — or a
     /// failed fan read while a writing mode is commanded — degrades to
     /// observe + monitor-only: never command manual mode while AUTO cannot
     /// be restored. `Auto` ⇒ nothing written (idempotent; no write on the
     /// healthy path).
-    fn reconcile_stale_state(&mut self) {
-        let fan = match self.smc.read_fan() {
-            Ok(fan) => fan,
+    fn reconcile_stale_state(&mut self, inherited: Result<FanMode, crate::smc::SmcError>) {
+        let inherited = match inherited {
+            Ok(mode) => mode,
             Err(e) => {
                 if self.mode != RunMode::Observe {
                     let msg = format!(
@@ -324,16 +389,16 @@ impl Supervisor {
                     self.degrade_startup_to_observe();
                 } else {
                     tracing::warn!(
-                        "startup reconcile: cannot read fan state: {e} (observe mode writes nothing; continuing without reconcile)"
+                        "startup reconcile: cannot read fan state: {e} (observe mode issues no control write; continuing without reconcile)"
                     );
                 }
                 return;
             }
         };
-        if fan.mode == FanMode::Auto {
+        if inherited == FanMode::Auto {
             return; // healthy path: no write (reconcile is idempotent).
         }
-        let msg = "startup reconcile: previous process died without restoring AUTO (fan1_manual=1; SIGKILL/OOM-kill cannot run L2); restoring AUTO now";
+        let msg = "startup reconcile: previous process died without restoring AUTO (fan mode was Manual at startup; SIGKILL/OOM-kill cannot run L2); restoring AUTO now";
         tracing::warn!("{msg}");
         match self.smc.set_mode(FanMode::Auto) {
             Ok(_) => {
@@ -342,11 +407,11 @@ impl Supervisor {
                 self.note_recent(
                     "startup reconcile: stale manual mode restored to AUTO".to_owned(),
                 );
-                tracing::info!("startup reconcile: AUTO restored (fan1_manual=0, verified)");
+                tracing::info!("startup reconcile: AUTO restored (fan mode verified Auto)");
             }
             Err(e) => {
                 let msg = format!(
-                    "startup reconcile: restoring AUTO failed: {e} (fix: check fan1_manual writability as root); degrading to observe + monitor-only: never command manual while AUTO cannot be restored"
+                    "startup reconcile: restoring AUTO failed: {e} (fix: run as root so the fan mode attribute is writable); degrading to observe + monitor-only: never command manual while AUTO cannot be restored"
                 );
                 tracing::error!("{msg}");
                 self.note_recent(msg);
@@ -370,10 +435,29 @@ impl Supervisor {
         self.auto_retry_log_polls = 0;
     }
 
+    /// RULING F27: the per-poll snapshot of which safety layers are actually
+    /// armed. `l2_death_path` comes from `safety::is_armed()` rather than any
+    /// local intention, so it is true exactly when a usable descriptor is
+    /// installed — whoever installed it.
+    fn safety_layers(&self) -> SafetyLayers {
+        SafetyLayers {
+            backend: self.capabilities.backend,
+            l1_verify: !self.monitor_only,
+            l2_death_path: crate::safety::is_armed(),
+            // Presence check only — never a side-effecting WATCHDOG ping.
+            l3_watchdog_notify: std::env::var_os("NOTIFY_SOCKET").is_some(),
+            hw_watchdog: self.capabilities.hw_watchdog,
+            firmware_auto_on_suspend: self.capabilities.firmware_auto_on_suspend,
+        }
+    }
+
     /// One startup evidence line (RULING F14 observability): effective mode,
-    /// L2 armed, watchdog notify path, config source, hw band — the journal
-    /// previously carried only systemd's lines. RULING F18 (A4, N-F14-1):
-    /// `RuntimePaths.config_source` now supplies the resolved `--config` path.
+    /// backend + bound ABI generation, L2 armed, watchdog notify path, config
+    /// source, hw band — the journal previously carried only systemd's lines.
+    /// RULING F18 (A4, N-F14-1): `RuntimePaths.config_source` supplies the
+    /// resolved `--config` path. RULING F26: `backend` names the generation,
+    /// because "which attribute set did we bind" is the first question any
+    /// kernel-upgrade bug report needs answered.
     fn startup_evidence_line(&self, l2_armed: bool) {
         // Presence check only — never a side-effecting WATCHDOG ping.
         let watchdog_notify = std::env::var_os("NOTIFY_SOCKET").is_some();
@@ -387,8 +471,9 @@ impl Supervisor {
     /// finding 8): every field, including `config_source`, must survive.
     fn startup_evidence_message(&self, l2_armed: bool, watchdog_notify: bool) -> String {
         format!(
-            "afanctl daemon startup: mode={}, l2_armed={l2_armed}, watchdog_notify={watchdog_notify}, state_file={}, config_source={}, hw_band={}..{} rpm",
+            "afanctl daemon startup: mode={}, backend={}, l2_armed={l2_armed}, watchdog_notify={watchdog_notify}, state_file={}, config_source={}, hw_band={}..{} rpm",
             mode_name(&self.mode),
+            self.capabilities.backend,
             self.paths.state.display(),
             self.paths.config_source.display(),
             self.hw_min,
@@ -492,7 +577,7 @@ impl Supervisor {
         // the startup guard degraded the mode, so a cmd file must not re-arm
         // control behind its back.
         if self.l2_absent && requested != RunMode::Observe {
-            let msg = "L2 death path unavailable (panic fd was not opened at startup); refusing to enter control from cmd.json (fix: restart with a writable fan1_manual)";
+            let msg = "L2 death path unavailable (the arm-time restore probe did not pass at startup); refusing to enter control from cmd.json (fix: restart as root so the fan mode attribute is writable)";
             tracing::error!("{msg}");
             self.note_recent(msg.to_owned());
             notes.push("cmd refused: no L2".into());
@@ -525,8 +610,8 @@ impl Supervisor {
                         self.auto_restore_pending = false;
                         self.auto_restore_attempts = 0;
                         self.auto_retry_log_polls = 0;
-                        notes.push("cmd applied: observe (fan1_manual=0)".into());
-                        "fan released to AUTO (fan1_manual=0, verified)".to_owned()
+                        notes.push("cmd applied: observe (fan released to AUTO)".into());
+                        "fan released to AUTO (mode verified Auto)".to_owned()
                     }
                     Err(e) => {
                         // SAFETY-INVARIANT (RULING F21 R1, the cmd-file
@@ -559,7 +644,7 @@ impl Supervisor {
         // so name the arm state on the way rather than claim a verification
         // that has not happened yet. A previous writer mode keeps the fan.
         let fan_state = if self.manual_armed {
-            "fan1_manual=1 (already armed)".to_owned()
+            "fan mode already Manual (already armed)".to_owned()
         } else {
             "arming on the control write this poll".to_owned()
         };
@@ -631,13 +716,13 @@ impl Supervisor {
                 Some(verified)
             }
             Err(e) => {
-                self.fail_write(format!("fan1_output {target}: {e}"), notes);
+                self.fail_write(format!("rpm target {target}: {e}"), notes);
                 None
             }
         }
     }
 
-    /// Put `fan1_manual` into Manual through the verify path; false on failure.
+    /// Put the fan into Manual through the verify path; false on failure.
     fn enter_manual(&mut self, notes: &mut Vec<String>) -> bool {
         match self.smc.set_mode(FanMode::Manual) {
             Ok(_) => {
@@ -645,7 +730,7 @@ impl Supervisor {
                 true
             }
             Err(e) => {
-                self.fail_write(format!("fan1_manual manual write error: {e}"), notes);
+                self.fail_write(format!("set Manual write error: {e}"), notes);
                 false
             }
         }
@@ -654,7 +739,7 @@ impl Supervisor {
     // ---- step 4: L1 (R4) ----
 
     /// RULING F16 (R2/R3) — L1 is three independent checks:
-    /// - **Mode drift**: `fan1_manual` reads `Auto` while we own the fan ⇒
+    /// - **Mode drift**: the fan mode reads `Auto` while we own the fan ⇒
     ///   re-assert `set_mode(Manual)`; its failures are counted.
     /// - **Tracking**: actual rpm more than `VERIFY_TOLERANCE_RPM` from the
     ///   last written value ⇒ idempotent re-assert of the write, *never
@@ -888,7 +973,7 @@ impl Supervisor {
         self.stall_polls = 0;
         self.off_target_polls = 0;
         let msg = format!(
-            "AUTO restored after {} attempts (fan1_manual=0, verified)",
+            "AUTO restored after {} attempts (fan mode verified Auto)",
             self.auto_restore_attempts
         );
         tracing::info!("{msg}");
@@ -935,6 +1020,7 @@ impl Supervisor {
             auto_restore_pending: self.auto_restore_pending,
             watchdog_pings: self.watchdog_pings,
             polls: self.polls,
+            safety: self.safety_layers(),
             recent_errors: &self.recent_errors,
         };
         let body = serde_json::to_string(&state);
@@ -980,7 +1066,7 @@ fn mode_name(mode: &RunMode) -> String {
 
 /// RULING F24 (R7): one-line INFO message for a real mode transition.
 /// `mode_name(Hold)` already carries the rpm; `fan_state` names the
-/// `fan1_manual` outcome on the way (release verified/failed, arm already
+/// fan-mode outcome on the way (release verified/failed, arm already
 /// held, or the pending arm the control write performs).
 fn mode_change_message(from: &RunMode, to: &RunMode, fan_state: &str) -> String {
     format!(
@@ -1235,8 +1321,16 @@ mod tests {
         fn set_mode(&mut self, mode: FanMode) -> Result<FanMode, crate::smc::SmcError> {
             self.smc().set_mode(mode)
         }
-        fn panic_fd(&self) -> Option<i32> {
-            self.smc().panic_fd()
+        fn safe_restore(&self) -> Option<crate::safety::SafeRestore> {
+            self.smc().safe_restore()
+        }
+        fn probe_safe_restore(
+            &mut self,
+        ) -> Result<crate::safety::SafeRestore, crate::smc::SmcError> {
+            self.smc().probe_safe_restore()
+        }
+        fn safety_capabilities(&self) -> SafetyCapabilities {
+            self.smc().safety_capabilities()
         }
     }
 
@@ -1367,7 +1461,10 @@ mod tests {
             logs.contains("mode change: curve -> hold 3000"),
             "hold must name its rpm: {logs}"
         );
-        assert!(logs.contains("(fan1_manual=1"), "already armed: {logs}");
+        assert!(
+            logs.contains("(fan mode already Manual"),
+            "already armed: {logs}"
+        );
 
         // A real transition back to observe names the release.
         dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"observe"}"#);
@@ -1639,7 +1736,10 @@ mod tests {
         let sm = mock_with(vec![hot()]);
         sm.set_fan_state(HW_MIN, FanMode::Manual); // SIGKILLed predecessor
         let mut sup = supervisor(&sm, RunMode::Observe, &dir);
-        sup.reconcile_stale_state();
+        // RULING F27: `run()` samples the inherited mode before the arm-time
+        // probe writes; a direct unit call supplies the same snapshot.
+        let inherited = sup.smc.read_fan().map(|f| f.mode);
+        sup.reconcile_stale_state(inherited);
         assert_eq!(sm.fan().mode, FanMode::Auto, "AUTO restored");
         assert_eq!(
             sm.write_attempts(),
@@ -1657,7 +1757,10 @@ mod tests {
         let dir = TempDir::new();
         let sm = mock_with(vec![hot()]);
         let mut sup = supervisor(&sm, RunMode::Curve, &dir);
-        sup.reconcile_stale_state();
+        // RULING F27: `run()` samples the inherited mode before the arm-time
+        // probe writes; a direct unit call supplies the same snapshot.
+        let inherited = sup.smc.read_fan().map(|f| f.mode);
+        sup.reconcile_stale_state(inherited);
         assert_eq!(sm.write_attempts(), 0, "healthy path must not write");
         assert_eq!(sup.mode, RunMode::Curve, "mode untouched");
         assert!(!sup.monitor_only);
@@ -1671,7 +1774,10 @@ mod tests {
         let sm = mock_with(vec![hot()]);
         sm.set_fan_read_fault(Some(std::io::ErrorKind::PermissionDenied));
         let mut sup = supervisor(&sm, RunMode::Curve, &dir);
-        sup.reconcile_stale_state();
+        // RULING F27: `run()` samples the inherited mode before the arm-time
+        // probe writes; a direct unit call supplies the same snapshot.
+        let inherited = sup.smc.read_fan().map(|f| f.mode);
+        sup.reconcile_stale_state(inherited);
         assert_eq!(sup.mode, RunMode::Observe);
         assert!(sup.monitor_only);
         assert_eq!(sm.write_attempts(), 0, "no write on an unconfirmable fan");
@@ -1686,7 +1792,10 @@ mod tests {
         sm.set_fan_state(HW_MIN, FanMode::Manual);
         sm.set_mode_read_back(Some(FanMode::Manual)); // AUTO write never verifies
         let mut sup = supervisor(&sm, RunMode::Observe, &dir);
-        sup.reconcile_stale_state();
+        // RULING F27: `run()` samples the inherited mode before the arm-time
+        // probe writes; a direct unit call supplies the same snapshot.
+        let inherited = sup.smc.read_fan().map(|f| f.mode);
+        sup.reconcile_stale_state(inherited);
         assert_eq!(sup.mode, RunMode::Observe);
         assert!(sup.monitor_only);
         assert!(
@@ -1730,7 +1839,7 @@ mod tests {
 
     /// RULING F16 test 2: takeover — mock in Auto with the tach at 6170 while
     /// a hold command arrives ⇒ manual armed, the write is verified by the
-    /// `fan1_output` echo, no fallback.
+    /// rpm-target echo, no fallback.
     #[test]
     fn f16_takeover_from_auto_verifies_by_echo() {
         let dir = TempDir::new();
@@ -1804,7 +1913,7 @@ mod tests {
         assert!(sup.monitor_only, "echo failures must fall back");
     }
 
-    /// RULING F16 test 5: mode drift — the mock flips `fan1_manual` back to
+    /// RULING F16 test 5: mode drift — the mock flips the fan mode back to
     /// Auto each poll ⇒ every re-assert is counted ⇒ fallback.
     #[test]
     fn f16_mode_drift_counts_and_falls_back() {
@@ -1826,7 +1935,7 @@ mod tests {
         assert!(
             sup.recent_errors
                 .iter()
-                .any(|e| e.msg.contains("fan1_manual manual write error")),
+                .any(|e| e.msg.contains("set Manual write error")),
             "each mode-drift re-assert is recorded: {:?}",
             sup.recent_errors
         );
@@ -2029,7 +2138,7 @@ mod tests {
         sup.step_once();
         assert!(!sup.auto_restore_pending, "the retry cleared the flag");
         assert!(!sup.manual_armed, "the fan is released");
-        assert_eq!(sm.fan().mode, FanMode::Auto, "fan1_manual=0");
+        assert_eq!(sm.fan().mode, FanMode::Auto, "fan mode restored to Auto");
         assert!(
             sup.recent_errors
                 .iter()
@@ -2147,7 +2256,7 @@ mod tests {
         dir.write_cmd(r#"{"schema":"afanctl.cmd.v1","mode":"hold","rpm":4000}"#);
         let sm = mock_with(vec![hot()]);
         let mut sup = supervisor(&sm, RunMode::Observe, &dir);
-        sup.l2_absent = true; // the startup guard's verdict (panic_fd absent)
+        sup.l2_absent = true; // the startup guard's verdict (probe did not pass)
         let rep = sup.step_once();
         assert_eq!(rep.mode, RunMode::Observe);
         assert_eq!(sm.write_attempts(), 0, "no control without L2");
@@ -2258,6 +2367,7 @@ mod tests {
         for field in [
             "afanctl daemon startup",
             "mode=curve",
+            "backend=mock",
             "l2_armed=true",
             "watchdog_notify=false",
             "state_file=",

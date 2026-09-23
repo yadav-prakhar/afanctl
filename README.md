@@ -32,19 +32,42 @@
 > 🎯 **Scope:** one fan, one machine class. All sysfs path knowledge lives in
 > one module; the control policy is pure and table-tested.
 
+## Supported kernels
+
+applesmc exposes two different sysfs attribute sets. **afanctl supports both in
+one binary** and binds one at startup by probing for the files — never by
+parsing a kernel version. `afanctl doctor` prints which one it bound.
+
+| Generation | Kernel | rpm setpoint | Mode attribute | Manual | **AUTO** |
+| ---------- | ------ | ------------ | -------------- | ------ | -------- |
+| `legacy`   | **<= 7.2** | `fan1_output` | `fan1_manual` | `1` | **`0`** |
+| `modern`   | **>= 7.3** | `fan1_target` | `pwm1_enable` | `1` | **`2`** |
+
+Kernel commit `94f5081d` (released in 7.3) renamed both attributes with no
+back-compat aliasing, and changed the mode vocabulary: on `pwm1_enable`, `0` is
+rejected with `-EINVAL`, so the AUTO token that hands the fan back to the
+firmware differs between generations. `fan1_max` also became read-only (afanctl
+only ever reads it) and there is no `pwm1` duty attribute. Details:
+[docs/SAFETY.md](docs/SAFETY.md).
+
 ## How it works
 
-`afanctl` reads `coretemp` sensors, drives the single fan through `applesmc`'s
-`fan1_manual` / `fan1_output`, and — when anything goes wrong — gets out of
-the way and lets the SMC firmware run the fan again.
+`afanctl` reads `coretemp` sensors, drives the single fan through the
+`applesmc` attribute set it detected, and — when anything goes wrong — gets out
+of the way and lets the SMC firmware run the fan again.
 
 | Layer | Guarantee |
 | ----- | --------- |
 | **L1 — per-poll verify / re-assert** | Mode drift and write failures feed a 3-strike ladder to AUTO + monitor-only; tracking wobble is re-asserted, never counted; a stall detector catches a motionless tach |
-| **L2 — death path** | Pre-opened fd + panic/signal handlers restore AUTO in a single `write(2)` — proven by the `selftest-panic` probe |
+| **L2 — death path** | Pre-opened fd + panic/signal handlers restore firmware control in a single `write(2)`, using the **bound generation's own restore bytes** — proven at daemon arm time by a real write, and by the `selftest-panic` probe. An unprovable restore is reported absent, never armed |
 | **L3 — systemd-first** | `Type=notify` + watchdog + `Restart=always` + sandboxing, so a hang or crash restarts rather than stranding the fan |
 
-Full rationale and constants: [Safety Model](https://github.com/yadav-prakhar/afanctl/wiki/Safety-Model).
+`status --json` reports which layers are actually armed (`safety.l1_verify`,
+`.l2_death_path`, `.l3_watchdog_notify`, `.hw_watchdog`,
+`.firmware_auto_on_suspend`) rather than a single boolean.
+
+Full rationale and constants: [docs/SAFETY.md](docs/SAFETY.md) ·
+[Safety Model](https://github.com/yadav-prakhar/afanctl/wiki/Safety-Model).
 
 ## Install
 
@@ -109,9 +132,10 @@ Exit codes: `0` success · `1` runtime failure · `2` usage error · `101` delib
 📚 Every verb, flag and exit code: [CLI Reference](https://github.com/yadav-prakhar/afanctl/wiki/CLI-Reference) ·
 🩺 All checks, `--roundtrip` and `--compare`: [Diagnostics (doctor)](https://github.com/yadav-prakhar/afanctl/wiki/Diagnostics-%28doctor%29)
 
-> **Run doctor as root.** The write-mode checks open the manual file `O_WRONLY`,
-> so as non-root they FAIL by design (exit 1) — an unwritable manual file leaves
-> the L2 death path unarmed, which is exactly a real problem, not a false alarm.
+> **Run doctor as root.** The write-mode checks open the fan mode attribute
+> `O_WRONLY`, so as non-root they FAIL by design (exit 1) — an unwritable mode
+> attribute leaves the L2 death path unarmed, which is exactly a real problem,
+> not a false alarm.
 
 ## Configuration
 

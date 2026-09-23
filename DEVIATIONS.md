@@ -295,3 +295,121 @@ absorbed silently (§8).
 - Design note recorded in QUESTIONS.md `N-F20-1`: `l2_absent` is the
   startup-verdict form of R3's guard — the literal per-poll recheck would
   break the frozen MockSmc semantics (Appendix A) the suite is built on.
+
+## F26 — applesmc ABI generation binding (branch `fix/applesmc-kernel-7.3-abi`, 2026-09-21)
+
+### RULING F26 (issue #2): `smc.rs` binds one of TWO applesmc attribute generations, by file probe
+
+- **Old (DESIGN.md Appendix A / PRD §2.1):** the fan attribute names are
+  constants — `fan1_output` is the actuator, `fan1_manual` is the mode bit
+  with the vocabulary `0 = auto, 1 = manual`, `fan1_max` is writable.
+- **New:** `smc.rs` owns a two-entry table (`LEGACY`, `MODERN`) and binds one
+  entry at `SysfsSmc::open` by probing for the **mode attribute**, which is the
+  discriminator. Legacy (kernel <= 7.2): `fan1_output` + `fan1_manual`,
+  Manual = `1`, Auto = `0`. Modern (kernel >= 7.3): `fan1_target` +
+  `pwm1_enable`, Manual = `1`, **Auto = `2`**, `fan1_max` read-only, no `pwm1`.
+  Every attribute name and every mode token — the L2 restore bytes included —
+  is derived from the bound entry. Added public items: `AbiGeneration` (+
+  `token()`), inherent `SysfsSmc::abi_generation()` and
+  `SysfsSmc::abi_evidence()` (the `layout_changed` precedent, ruling T3 N2).
+  `FanMode` stays an enum; only the byte written changes.
+- **Why:** kernel commit `94f5081d` ("hwmon: (applesmc) Convert to
+  `hwmon_device_register_with_info`", released in 7.3) renamed both attributes
+  with **no back-compat aliasing** — the hwmon core generates attribute names
+  from the driver's declared bitmask, and the conversion deleted the legacy
+  `fan_group[]` table that created the old names. `open()` on `fan1_manual`
+  returns `ENOENT` on >= 7.3, so afanctl does not start. Detection is by file
+  probe and never by parsing a kernel version string: distributions backport,
+  and the attribute set is the only truth. A tree exposing **both** mode
+  attributes is refused rather than guessed at, because the AUTO tokens are
+  mutually incompatible (legacy `2` means *manual*; modern `0` is `-EINVAL`),
+  so a wrong guess is precisely the hazard this ruling exists to prevent.
+- **Judgement call the issue asks to be recorded — attribute names in
+  log/error strings and `doctor` check names:**
+  - **`doctor` check names: UNCHANGED, deliberately.** They are effectively a
+    public contract (scripts and the plugin match on them) and a name that
+    shifted under a kernel upgrade would be the worst of both worlds. The
+    bound generation appears instead in the *evidence details*, plus one
+    **additive** check, `applesmc ABI generation`, whose detail string is
+    built inside `smc.rs` (R1: `doctor` still spells no attribute name of its
+    own). `doctor_reports_the_detected_abi_generation_for_both_generations`
+    pins the name list as identical on both generations. Additive check names
+    have precedent (`stale-binary`, `daemon mode`).
+  - **Log/error strings in `supervisor.rs` and `cli.rs`: made
+    generation-neutral NOW, not in Phase 1.** They described the *attribute*
+    (`fan1_manual=0`); they now describe the *logical mode* (`fan mode
+    verified Auto`). Reason: a message naming `fan1_manual` on a 7.3 machine
+    is actively misleading in exactly the bug report where it matters most,
+    and the correct attribute name still reaches the user — `SmcError::Write`
+    / `::InvalidValue` name the real path, generation-correctly by
+    construction. Threading a name out of `smc.rs` instead would have broken
+    R1 for zero benefit. Cost: four unit-test assertions on those strings were
+    updated. Phase 1's capability model owns any further naming work.
+- **Affected areas:** `src/smc.rs` (table, detection, all attribute use),
+  `src/doctor.rs` (additive check + details), `src/supervisor.rs` and
+  `src/cli.rs` (message wording only), `tests/fixtures/sysfs/modern/` (new
+  tree), `DESIGN.md` Appendix A, README/`docs/SAFETY.md`, `CHANGELOG.md`.
+
+## F27 — per-backend L2 safe restore (branch `fix/applesmc-kernel-7.3-abi`, 2026-09-21)
+
+### RULING F27 (issue #3): the L2 restore target is a per-backend descriptor, proven at arm time
+
+- **Old (DESIGN.md Appendix A):** `safety.rs` held
+  `static AUTO: [u8; 1] = *b"0"` and `install_death_path(panic_fd: i32)` wrote
+  that one byte to a fd the backend pre-opened on `fan1_manual`. `Smc` exposed
+  `fn panic_fd(&self) -> Option<i32>`, and a present fd *was* "L2 armed".
+- **New:** `safety.rs` gains `SafeRestore { fd, bytes: &'static [u8] }` (with
+  `new`/`fd`/`bytes`), `SafetyCapabilities`, and `is_armed()`.
+  `install_death_path(restore: SafeRestore)` replaces the fd parameter. `Smc`
+  replaces `panic_fd` with `safe_restore() -> Option<SafeRestore>`,
+  `probe_safe_restore() -> Result<SafeRestore, SmcError>` and
+  `safety_capabilities() -> SafetyCapabilities`. `safety.rs` now contains **no
+  attribute name and no restore value**: the backend supplies both.
+- **Why:** the compile-time byte is correct for exactly one backend on one
+  kernel generation. The same "one byte, one syscall" mechanism, ported by
+  renaming a path, yields a silent failure to restore (applesmc >= 7.3 answers
+  `-EINVAL` to `0`), a fan pinned at full speed forever (generic hwmon, where
+  `0` means *no control*), or a stopped fan on a hot laptop (the `pwm1` duty
+  file). L2 ignores write errors by design, so all three are silent. **F26's
+  rename is the first case that proves the descriptor is needed, which is why
+  the two land together**: the naive port of #2 — new path, old byte — is
+  strictly more dangerous than the startup failure it fixes.
+- **Async-signal-safety, preserved exactly:** the handler is still ONE
+  lock-free atomic load and ONE `write(2)`, with no allocation, formatting,
+  locks or path construction. The descriptor is published into leaked
+  `'static` storage at arm time (once per arm call, never inside a handler),
+  so a single `AtomicPtr` load reaches fd, pointer and length together — no
+  torn multi-atomic read. A multi-byte restore (thinkpad_acpi's `"level
+  auto"`) is still one `write(2)`; the length is part of the descriptor, and
+  the unit test uses a multi-byte payload on purpose so no single-byte
+  assumption can creep back.
+- **Arm-time probe:** `Supervisor::run()` (and `once`, and `selftest-panic`)
+  now write the restore bytes **through the descriptor's own fd** and then
+  verify the hardware reports Auto inside `MODE_SETTLE_MS`. Only a proven
+  restore arms L2; a failure logs `L2 death path ABSENT` loudly, records it in
+  `recent_errors`, and — via the existing F20 R3 guard — refuses every control
+  mode. **Narrowing recorded:** R3's "observe writes nothing" is hereby read as
+  "observe issues no *control* write". The probe writes only the fail-safe
+  value, so it can move the fan toward firmware control and never away; the
+  alternative (skip the probe in observe) would leave every observe-started
+  daemon permanently unable to accept a `cmd.json` control command, which is
+  the plugin's core flow.
+- **Startup order:** `run()` samples the inherited fan mode **before** the
+  probe, because the probe's own fail-safe write would otherwise erase the
+  evidence that a predecessor died owning the fan;
+  `reconcile_stale_state(inherited)` takes that snapshot as a parameter.
+  RULING F14's order (arm L2 → reconcile → sd_status/READY) is unchanged.
+- **`status`/`state` JSON:** an **additive** `safety` object reports the layers
+  that are actually armed — `backend` (including the bound ABI generation),
+  `l1_verify`, `l2_death_path` (read from `safety::is_armed()`, the single
+  truth, not from an intention recorded elsewhere), `l3_watchdog_notify`,
+  `hw_watchdog`, and `firmware_auto_on_suspend` as `boolean|null`. Schema ids
+  stay `afanctl.state.v1` / `afanctl.status.v1` on the F18/F20/F22 additive
+  precedent. `firmware_auto_on_suspend` is **`null` for applesmc**: there is no
+  evidence either way, and `false` would be a claim. `hw_watchdog` is `false`
+  because applesmc exposes none — arming one where it exists (thinkpad_acpi)
+  belongs to the separate hardware-watchdog issue, which this ruling only
+  makes *reportable*.
+- **Affected areas:** `src/safety.rs`, `src/smc.rs`, `src/supervisor.rs`,
+  `src/doctor.rs`, `src/cli.rs`, `tests/{integration,schema,pin_constants,settle_window}.rs`,
+  `DESIGN.md` Appendix A + B, `SECURITY.md`, `docs/SAFETY.md`, `CHANGELOG.md`.

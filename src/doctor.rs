@@ -4,15 +4,19 @@
 //! manual-mode write test and always restores AUTO: that test (and its
 //! restore) is the ONLY place this module calls a write. Checklist lines are
 //! `PASS|FAIL|WARN — <check> — <detail>`; `--json` reuses the same fields.
-//! Checks: applesmc+coretemp present, fan files present/writable, sensor
-//! plausibility vs Tjmax, `fan1_min/max` readback, config validation, systemd
-//! unit health, layout-change detection (Q4), L2 fd armed. `--compare N`
-//! samples `t_eff` + SMC rpm for N seconds and simulates the curve over the
-//! same trace. Exit 1 if any FAIL.
+//! Checks: applesmc+coretemp present, the detected ABI generation (RULING
+//! F26), fan files present/writable, sensor plausibility vs Tjmax,
+//! `fan1_min/max` readback, config validation, systemd unit health,
+//! layout-change detection (Q4), L2 fd armed. `--compare N` samples `t_eff` +
+//! SMC rpm for N seconds and simulates the curve over the same trace. Exit 1
+//! if any FAIL.
 //!
 //! Invariants: every sysfs read/write goes through `smc` (R1) — this module
-//! constructs no sysfs path and never calls `fs::write` itself; `--roundtrip`
-//! refuses to write unless the L2 fd is armed (root + writable `fan1_manual`).
+//! constructs no sysfs path, never names an attribute of its own, and never
+//! calls `fs::write` itself; `--roundtrip` refuses to write unless the L2 fd
+//! is armed (root + a writable mode attribute). RULING F26: check *names* are
+//! a public contract and stay generation-neutral; the bound generation and its
+//! attribute names appear in the evidence details, sourced from `smc`.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -327,16 +331,26 @@ fn diagnose(root: &Path, config_path: &Path, runtime_dir: &Path) -> (Report, Opt
                 "applesmc + coretemp present",
                 "devices discovered",
             ));
-            let writable = backend.panic_fd().is_some();
+            // RULING F26: the detected ABI generation is its own additive
+            // check, and its evidence string comes from `smc` (R1: this module
+            // never spells an attribute name itself).
+            checks.push(Check::pass(
+                "applesmc ABI generation",
+                backend.abi_evidence(),
+            ));
+            let writable = backend.safe_restore().is_some();
             checks.push(if writable {
                 Check::pass(
                     "fan files present & writable",
-                    "fan1_output present; fan1_manual writable",
+                    format!("bound {}", backend.abi_evidence()),
                 )
             } else {
                 Check::fail(
                     "fan files present & writable",
-                    "fan1_manual not writable (fix: run doctor as root; an unwritable manual file leaves L2 unarmed)",
+                    format!(
+                        "the fan mode attribute is not writable (fix: run doctor as root; an unwritable mode attribute leaves L2 unarmed). Bound {}",
+                        backend.abi_evidence()
+                    ),
                 )
             });
             checks.push(sensor_check(&backend));
@@ -346,7 +360,7 @@ fn diagnose(root: &Path, config_path: &Path, runtime_dir: &Path) -> (Report, Opt
             } else {
                 Check::fail(
                     "fan1_min/max readback",
-                    format!("invalid hardware band {lo}..{hi} rpm (fix: check fan1_min/fan1_max)"),
+                    format!("invalid hardware band {lo}..{hi} rpm (fix: check fan1_min/fan1_max — both survived the ABI conversion, but fan1_max is read-only on kernel >= 7.3)"),
                 )
             });
             checks.push(config_check(
@@ -367,16 +381,30 @@ fn diagnose(root: &Path, config_path: &Path, runtime_dir: &Path) -> (Report, Opt
                     "fan1_* directly in the applesmc platform dir",
                 )
             });
-            checks.push(if writable {
-                Check::pass("L2 fd armed", "pre-opened O_WRONLY fan1_manual")
-            } else {
-                Check::fail("L2 fd armed", "no death-path fd (fix: run doctor as root)")
+            // RULING F27: doctor is read-only, so it reports that a
+            // descriptor EXISTS and what it would write. Proving it needs a
+            // real write and belongs to the daemon's arm-time probe (or
+            // `--roundtrip`), never to a read-only diagnosis.
+            checks.push(match backend.safe_restore() {
+                Some(restore) => Check::pass(
+                    "L2 fd armed",
+                    format!(
+                        "pre-opened O_WRONLY on the mode attribute; restore payload {:?} ({} ABI) — proven at daemon arm time",
+                        String::from_utf8_lossy(restore.bytes()),
+                        backend.abi_generation().token()
+                    ),
+                ),
+                None => Check::fail("L2 fd armed", "no death-path fd (fix: run doctor as root)"),
             });
             Some(backend)
         }
         Err(e) => {
             let detail = e.to_string();
             checks.push(Check::fail("applesmc + coretemp present", &detail));
+            checks.push(Check::fail(
+                "applesmc ABI generation",
+                format!("undetermined: {detail}"),
+            ));
             checks.push(Check::fail(
                 "fan files present & writable",
                 format!("discovery failed: {detail}"),
@@ -647,15 +675,17 @@ fn classify_stale_binary(started: Option<i64>, mtime: Option<i64>) -> Check {
 }
 
 /// `--roundtrip`: the ONLY write doctor performs (plus its mandatory restore).
-/// Refuses to write unless the L2 fd is armed (root + writable `fan1_manual`),
-/// then: set Manual (verify) → write `fan1_min` (verify) → hold → read →
-/// ALWAYS restore Auto (verify). A failed restore is reported as `DANGER`.
+/// Refuses to write unless the L2 fd is armed (root + a writable mode
+/// attribute), then: set Manual (verify) → write `fan1_min` (verify) → hold →
+/// read → ALWAYS restore Auto (verify). A failed restore is reported as
+/// `DANGER`. RULING F26: the mode token written is the bound generation's,
+/// resolved inside `smc`.
 fn roundtrip_manual_test(smc: &mut dyn Smc, hold: Duration) -> Check {
     let name = "roundtrip manual write test";
-    if smc.panic_fd().is_none() {
+    if smc.safe_restore().is_none() {
         return Check::fail(
             name,
-            "--roundtrip requires root (fan1_manual not writable); refused to write",
+            "--roundtrip requires root (the fan mode attribute is not writable); refused to write",
         );
     }
     let mut problems: Vec<String> = Vec::new();
@@ -940,6 +970,49 @@ mod tests {
 
     fn any_fail(report: &Report) -> bool {
         report.checks.iter().any(|c| c.status == Status::Fail)
+    }
+
+    /// RULING F26: `doctor` reports the detected ABI generation in its
+    /// evidence for BOTH generations, and its check *names* stay
+    /// generation-neutral — the names are a public contract that must not
+    /// shift under a kernel upgrade, so the generation lives in the details.
+    #[test]
+    fn doctor_reports_the_detected_abi_generation_for_both_generations() {
+        let mut name_lists: Vec<Vec<String>> = Vec::new();
+        for (variant, generation, mode_attr, target_attr, restore) in [
+            ("", "legacy", "fan1_manual", "fan1_output", "\"0\""),
+            ("modern", "modern", "pwm1_enable", "fan1_target", "\"2\""),
+        ] {
+            let fixture = TempFixture::copy_of(variant);
+            let (report, smc) = diagnose(&fixture.root, &fixture.config_path(), &fixture.root);
+            assert!(smc.is_some(), "{variant}: discovery must succeed");
+
+            let abi = check(&report, "applesmc ABI generation");
+            assert_eq!(abi.status, Status::Pass, "{variant}: {}", abi.detail);
+            for needle in [generation, mode_attr, target_attr] {
+                assert!(
+                    abi.detail.contains(needle),
+                    "{variant}: the evidence line must name `{needle}`: {}",
+                    abi.detail
+                );
+            }
+
+            // The L2 evidence names the payload THIS generation would write.
+            let l2 = check(&report, "L2 fd armed");
+            assert_eq!(l2.status, Status::Pass, "{variant}: {}", l2.detail);
+            assert!(
+                l2.detail.contains(restore),
+                "{variant}: L2 evidence must name the restore payload {restore}: {}",
+                l2.detail
+            );
+            assert!(!any_fail(&report), "{variant}: {:?}", report.checks);
+
+            name_lists.push(report.checks.iter().map(|c| c.name.clone()).collect());
+        }
+        assert_eq!(
+            name_lists[0], name_lists[1],
+            "check names are a public contract: identical on both ABI generations"
+        );
     }
 
     fn default_cfg() -> ResolvedConfig {

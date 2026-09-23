@@ -1,6 +1,11 @@
-Fixture sysfs tree — mirrors PRD §2.1 exactly (verified live 2026-09-14).
+Fixture sysfs trees — the canonical tree at the root mirrors PRD §2.1 exactly
+(verified live 2026-09-14) and is the **legacy** (kernel <= 7.2) applesmc ABI.
 
-Layout:
+RULING F26: applesmc has two attribute generations and afanctl supports both,
+so `modern/` (below) is a full kernel >= 7.3 tree. Every test that asserts on
+an attribute name must say which generation it is exercising.
+
+Layout (legacy / canonical):
   devices/platform/applesmc.768/
     fan1_label   = "Exhaust"       (single-fan scope)
     fan1_min     = 1200            (hardware range floor; all writes clamped here)
@@ -41,3 +46,32 @@ committed trees; mutation-needing tests copy a tree to a tempdir first):
   layout_changed/   fan1_* moved INTO applesmc.768/hwmon/hwmon3/ (Q4 hwmon
                     conversion happened; discovery walks and finds it,
                     fan1_input = 3400 — exercises the layout-change hook)
+
+The modern (kernel >= 7.3) ABI tree (RULING F26; added with issues #2 + #3):
+
+  modern/           devices/platform/applesmc.768/
+                      fan1_label   = "Exhaust"     (unchanged)
+                      fan1_min     = 1200          (unchanged, RW)
+                      fan1_max     = 7200          (unchanged name, now RO 0444
+                                                    upstream; afanctl only reads
+                                                    it — tests chmod a copy to
+                                                    prove that)
+                      fan1_input   = 1200          (unchanged)
+                      fan1_target  = 1200          (was fan1_output)
+                      pwm1_enable  = 2             (was fan1_manual; 1 = manual,
+                                                    2 = AUTO, 0 = -EINVAL)
+                      fan1_safe    = (empty)       (retained via extra_groups)
+                    and the same coretemp.0 subtree as the canonical tree.
+
+  NOTE: there is deliberately **no `pwm1`** — applesmc declares only
+  HWMON_PWM_ENABLE, so the duty attribute does not exist. Nothing may create
+  one, and `modern_abi_daemon_takes_control_and_l2_restores_auto_token_2`
+  asserts no `fan1_output` appears either.
+
+  File permissions are NOT carried by git (only the exec bit is), so the
+  read-only-ness of `fan1_max` is applied by `chmod` on a tempdir copy inside
+  the tests that need it, exactly as the read-fault tests already do.
+
+  Ambiguous ("both generations present") and half-converted trees are built by
+  mutating a tempdir copy rather than committed, since they are error paths
+  that must never be mistaken for a supported layout.
